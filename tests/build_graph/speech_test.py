@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import pytest
+import torch
 from _test_configs import (
     SPEECH_CONFIGS,
     TINY_HEAD_DIM,
@@ -36,8 +37,12 @@ from mobius._configs import (
     TTSConfig,
 )
 from mobius._registry import registry
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
+from mobius.models.qwen3_omni import Qwen3OmniThinkerForConditionalGeneration
+from mobius.rewrite_rules._testing_utils import fill_random_weights
 from mobius.tasks import (
+    SpeechLanguageTask,
     get_task,
 )
 
@@ -860,6 +865,132 @@ class TestBuildGraphQwen3ASR:
         logits = dec_out["logits"]
         assert logits.shape[0] == 1
         assert logits.shape[1] == seq_len
+
+
+class TestBuildGraphQwen3Omni:
+    """Verify the Qwen3-Omni thinker 3-model split with SpeechLanguageTask."""
+
+    def _omni_config(self):
+        config = next(ov for mt, ov, _ in SPEECH_CONFIGS if mt == "qwen3_omni_moe")
+        return _base_config(**config)
+
+    def _build(self, config):
+        module = Qwen3OmniThinkerForConditionalGeneration(config)
+        return module, build_from_module(module, config, task=SpeechLanguageTask())
+
+    def test_registry_lookup(self):
+        assert registry.get("qwen3_omni_moe") is Qwen3OmniThinkerForConditionalGeneration
+        assert _default_task_for_model("qwen3_omni_moe") == "speech-language"
+
+    def test_decoder_is_moe(self):
+        """Every decoder layer routes through a top-k gate; the encoder shares Qwen3-ASR's IO."""
+        _, pkg = self._build(self._omni_config())
+
+        assert {inp.name for inp in pkg["audio_encoder"].graph.inputs} == {
+            "input_features",
+            "feature_attention_mask",
+        }
+        decoder = pkg["decoder"]
+        assert {"inputs_embeds", "attention_mask", "position_ids"} <= {
+            inp.name for inp in decoder.graph.inputs
+        }
+        topk_nodes = [n for n in decoder.graph.all_nodes() if n.op_type == "TopK"]
+        assert len(topk_nodes) == TINY_LAYERS
+
+    def test_preprocess_weights_maps_hf_checkpoint_names(self):
+        config = self._omni_config()
+        module = Qwen3OmniThinkerForConditionalGeneration(config)
+        num_experts = config.num_local_experts
+        inter = config.moe_intermediate_size
+        hidden = config.hidden_size
+        state_dict = {
+            "thinker.audio_tower.ln_post.weight": torch.ones(1),
+            "thinker.model.embed_tokens.weight": torch.ones(1),
+            "thinker.model.norm.weight": torch.ones(1),
+            "thinker.lm_head.weight": torch.ones(1),
+            "thinker.model.layers.0.mlp.gate.weight": torch.ones(1),
+            "thinker.model.layers.0.mlp.experts.gate_up_proj": torch.zeros(
+                num_experts, 2 * inter, hidden
+            ),
+            "thinker.model.layers.0.mlp.experts.down_proj": torch.zeros(
+                num_experts, hidden, inter
+            ),
+            "thinker.visual.merger.ln_q.weight": torch.ones(1),
+            "talker.model.norm.weight": torch.ones(1),
+            "code2wav.pre_transformer.norm.weight": torch.ones(1),
+        }
+
+        cleaned = module.preprocess_weights(state_dict)
+
+        expected = {
+            "audio_tower.ln_post.weight",
+            "embedding.embed_tokens.weight",
+            "decoder.norm.weight",
+            "decoder.lm_head.weight",
+            "decoder.layers.0.mlp.gate.weight",
+        }
+        for i in range(num_experts):
+            expected |= {
+                f"decoder.layers.0.mlp.experts.{i}.gate_proj.weight",
+                f"decoder.layers.0.mlp.experts.{i}.up_proj.weight",
+                f"decoder.layers.0.mlp.experts.{i}.down_proj.weight",
+            }
+        assert set(cleaned) == expected
+        assert cleaned["decoder.layers.0.mlp.experts.0.gate_proj.weight"].shape == (
+            inter,
+            hidden,
+        )
+
+    def test_3model_pipeline_runs_with_ort(self):
+        config = self._omni_config()
+        _, pkg = self._build(config)
+        for model in pkg.values():
+            fill_random_weights(model)
+
+        mel_seq = 100
+        enc_sess = OnnxModelSession(pkg["audio_encoder"])
+        enc_out = enc_sess.run(
+            {
+                "input_features": np.random.randn(
+                    1, config.audio.num_mel_bins, mel_seq
+                ).astype(np.float32),
+                "feature_attention_mask": np.ones((1, mel_seq), dtype=np.int64),
+            }
+        )
+        enc_sess.close()
+        valid_len = int(enc_out["audio_feature_lengths"][0])
+        audio_features = enc_out["audio_features"][0, :valid_len, :]
+
+        input_ids = np.array(
+            [[1, 2, *([config.audio.audio_token_id] * valid_len), 3]], dtype=np.int64
+        )
+        embed_sess = OnnxModelSession(pkg["embedding"])
+        inputs_embeds = embed_sess.run(
+            {"input_ids": input_ids, "audio_features": audio_features}
+        )["inputs_embeds"]
+        embed_sess.close()
+
+        seq_len = input_ids.shape[1]
+        kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+        past_kv = {
+            f"past_key_values.{i}.{kind}": np.zeros(kv_shape, dtype=np.float32)
+            for i in range(config.num_hidden_layers)
+            for kind in ("key", "value")
+        }
+        pos = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
+        decoder_sess = OnnxModelSession(pkg["decoder"])
+        dec_out = decoder_sess.run(
+            {
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+                "position_ids": np.stack([pos, pos, pos]),
+                **past_kv,
+            }
+        )
+        decoder_sess.close()
+
+        assert dec_out["logits"].shape == (1, seq_len, config.vocab_size)
+        assert np.isfinite(dec_out["logits"]).all()
 
 
 class TestBuildGraphFunASR:

@@ -174,6 +174,7 @@ __all__ = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
+    "Qwen3OmniThinkerForConditionalGeneration",
     "Qwen4ExpCausalLMModel",
     "SenseNovaU1Model",
     "SenseVoiceSmallModel",
@@ -394,6 +395,9 @@ from mobius.models.qwen3_asr import (
     Qwen3ASRForConditionalGeneration,
 )
 from mobius.models.qwen3_next import Qwen3NextCausalLMModel
+from mobius.models.qwen3_omni import (
+    Qwen3OmniThinkerForConditionalGeneration,
+)
 from mobius.models.qwen3_tts import (
     Qwen3TTSCodePredictorModel,
     Qwen3TTSEmbeddingModel,

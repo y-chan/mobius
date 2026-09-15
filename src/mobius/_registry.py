@@ -219,6 +219,7 @@ from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from mobius.models.qwen3_omni import Qwen3OmniThinkerForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
@@ -763,7 +764,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         variant="multimodal",
         test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
-    "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
     # --- DeepSeek (MLA + MoE) ---
     "deepseek_v2": ModelRegistration(DeepSeekV3CausalLMModel),
@@ -899,6 +899,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
+    ),
+    # Qwen3-Omni: thinker only (audio + text → text); vision/talker/code2wav are not exported.
+    "qwen3_omni_moe": ModelRegistration(
+        Qwen3OmniThinkerForConditionalGeneration, task="speech-language"
     ),
     "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),

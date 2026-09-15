@@ -1137,6 +1137,7 @@ class ArchitectureConfig(BaseModelConfig):
                     "olmo3",
                     "qwen3",
                     "qwen3_moe",
+                    "qwen3_omni_moe_text",
                     "qwen3_tts_talker",
                     "qwen3_5_vl",
                     "qwen3_vl",

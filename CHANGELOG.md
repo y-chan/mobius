@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Qwen3-Omni thinker speech-language export
+
+#### Added
+
+- `qwen3_omni_moe` now builds the Qwen3-Omni thinker as a `speech-language`
+  package (`audio_encoder` / `embedding` / `decoder`): the Qwen3-ASR audio
+  encoder, audio-token feature fusion, and a QK-norm MoE decoder with
+  interleaved MRoPE. The vision tower, talker, and code2wav are not exported.
+
+#### Fixed
+
+- Composite configs that carry both `thinker_config` and `talker_config`
+  (Qwen3-Omni) resolve to the thinker text config instead of the talker.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

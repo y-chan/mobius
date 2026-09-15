@@ -138,19 +138,15 @@ def _resolve_hf_config(hf_config, registration=None):
     owns_composite = (
         registration is not None and getattr(registration, "config_class", None) is not None
     )
-    if hasattr(hf_config, "talker_config"):
-        talker = hf_config.talker_config
-        # Qwen3-Omni talker nests the real model config under text_config
-        if hasattr(talker, "text_config"):
-            hf_config = talker.text_config
-        else:
-            hf_config = talker
-    elif hasattr(hf_config, "thinker_config"):
+    # Thinker before talker: Qwen3-Omni carries both and exports the thinker.
+    if hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
         if hasattr(thinker, "text_config"):
             hf_config = thinker.text_config
         else:
             hf_config = thinker
+    elif hasattr(hf_config, "talker_config"):
+        hf_config = hf_config.talker_config
     elif hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     elif hasattr(hf_config, "llm_config"):

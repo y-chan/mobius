@@ -218,6 +218,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "mms",
     "qwen3_asr",
     "qwen3_forced_aligner",
+    "qwen3_omni_moe",
     "qwen3_tts",
     "qwen3_tts_tokenizer_12hz",
     # Realtime's source-parity tests cover this architecture-discriminating alias.

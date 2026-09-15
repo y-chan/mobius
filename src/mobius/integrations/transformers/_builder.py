@@ -203,14 +203,16 @@ def _select_primary_config(hf_config):
     parent_config = hf_config
     model_type = hf_config.model_type
 
-    if hasattr(hf_config, "talker_config"):
-        hf_config = hf_config.talker_config
-    elif hasattr(hf_config, "thinker_config"):
+    # Check thinker before talker: Qwen3-Omni carries both, and its exported
+    # model is the thinker. Qwen3-TTS has only talker_config.
+    if hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
         if isinstance(thinker, dict):
             thinker = _dict_to_pretrained_config(thinker)
         if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
+    elif hasattr(hf_config, "talker_config"):
+        hf_config = hf_config.talker_config
     elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
         decoder = hf_config.decoder_config
         if isinstance(decoder, dict):

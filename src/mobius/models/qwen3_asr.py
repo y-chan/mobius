@@ -196,16 +196,17 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
         Args:
             input_features: (batch, num_mel_bins, mel_seq_len) mel
-                spectrogram. ``mel_seq_len`` MUST be a multiple of
-                ``2 * n_window`` (= 100 for both 0.6B and 1.7B).
-                The HF processor pads to 3000 frames by default,
-                which satisfies this.
+                spectrogram of any length. The graph right-pads it to
+                a multiple of ``2 * n_window`` (= 100 for Qwen3-ASR
+                and Qwen3-Omni); padded frames beyond
+                ``feature_attention_mask`` do not affect the valid
+                audio tokens.
             feature_attention_mask: (batch, mel_seq_len) int64 mask.
                 ``1`` = real audio frame, ``0`` = right-padding from
                 the processor. Required.
 
         Returns:
-            audio_features: (batch, mel_seq_len // chunk_size_mel *
+            audio_features: (batch, ceil(mel_seq_len / chunk_size_mel) *
                 tokens_per_chunk, output_dim). For 30s @ 100-frame
                 chunks: 390 tokens. Includes ``audio_feature_lengths``
                 padding-derived tokens at the tail; callers MUST crop
@@ -223,16 +224,28 @@ class Qwen3ASRAudioEncoder(nn.Module):
         num_mel_bins = self._num_mel_bins
 
         # ----------------------------------------------------------
-        # 1. Chunk the mel input.
+        # 1. Right-pad the time axis to a multiple of chunk_size_mel
+        #    so the chunk reshape below is valid for any length. The
+        #    Qwen3-ASR processor pads to 3000 frames, but the
+        #    Qwen3-Omni processor returns unpadded lengths. HF zero-
+        #    pads the last chunk the same way, and tokens past
+        #    audio_feature_lengths are cropped by the caller.
+        # ----------------------------------------------------------
+        chunk_size_const = op.Constant(value_ints=[chunk_size_mel])
+        mel_seq = op.Shape(input_features, start=2, end=3)  # (1,)
+        pad_len = op.Mod(
+            op.Sub(chunk_size_const, op.Mod(mel_seq, chunk_size_const)),
+            chunk_size_const,
+        )
+        pads = op.Concat(op.Constant(value_ints=[0, 0, 0, 0, 0]), pad_len, axis=0)
+        input_features = op.Pad(input_features, pads)
+
+        # ----------------------------------------------------------
+        # 2. Chunk the mel input.
         #    (B, num_mel_bins, mel_seq) → (B, num_mel_bins,
         #    num_chunks, chunk_size_mel) → (B, num_chunks,
         #    num_mel_bins, chunk_size_mel) → (B*num_chunks, 1,
         #    num_mel_bins, chunk_size_mel) for batched 2D conv.
-        #
-        #    Requires mel_seq divisible by chunk_size_mel. The
-        #    WhisperFeatureExtractor always pads to 3000 frames
-        #    (30s * 100 fps), which is divisible by the default
-        #    chunk_size_mel (2 * n_window = 100).
         # ----------------------------------------------------------
         chunked = op.Reshape(
             input_features,
@@ -246,7 +259,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         )  # (B*num_chunks, 1, num_mel_bins, chunk_size_mel)
 
         # ----------------------------------------------------------
-        # 2. Apply the 3 strided convolutions independently to each
+        # 3. Apply the 3 strided convolutions independently to each
         #    chunk. Same conv weights as HF (single shared set).
         # ----------------------------------------------------------
         conv_out = op.Gelu(self.conv2d1(op, flat_chunks))
@@ -255,7 +268,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         # (B*num_chunks, dhs, freq_after_conv, tokens_per_chunk)
 
         # ----------------------------------------------------------
-        # 3. Permute and flatten: (B*nc, dhs, freq, t) →
+        # 4. Permute and flatten: (B*nc, dhs, freq, t) →
         #    (B*nc, t, dhs, freq) → (B*nc, t, dhs*freq).
         # ----------------------------------------------------------
         conv_out = op.Transpose(conv_out, perm=[0, 3, 1, 2])
@@ -263,13 +276,13 @@ class Qwen3ASRAudioEncoder(nn.Module):
         # (B*num_chunks, tokens_per_chunk, conv_out_dim)
 
         # ----------------------------------------------------------
-        # 4. Linear projection to d_model.
+        # 5. Linear projection to d_model.
         # ----------------------------------------------------------
         chunked_features = self.conv_out(op, conv_out)
         # (B*num_chunks, tokens_per_chunk, d_model)
 
         # ----------------------------------------------------------
-        # 5. Add per-chunk positional embedding. HF reuses
+        # 6. Add per-chunk positional embedding. HF reuses
         #    PE[0:tokens_per_chunk] for EVERY chunk independently —
         #    cross-chunk ordering comes from the attention mask, not
         #    from PE.
@@ -285,7 +298,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         chunked_features = op.Add(chunked_features, pe_slice)
 
         # ----------------------------------------------------------
-        # 6. Reshape back to per-batch flat sequence:
+        # 7. Reshape back to per-batch flat sequence:
         #    (B*nc, t, d) → (B, nc*t, d).
         # ----------------------------------------------------------
         batch_size = op.Shape(input_features, start=0, end=1)  # (1,)
@@ -298,7 +311,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         # (B, total_post_conv, d_model)
 
         # ----------------------------------------------------------
-        # 7. Compute audio_feature_lengths via HF's
+        # 8. Compute audio_feature_lengths via HF's
         #    _get_feat_extract_output_lengths. For valid_mel ≥ 0
         #    (always true since the mask has 0/1 values):
         #      num_full_chunks = valid_mel // chunk_size_mel
@@ -328,7 +341,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         audio_feature_lengths = op.Add(full_contrib, s3)  # (B,) int64
 
         # ----------------------------------------------------------
-        # 8. Build the block-diagonal attention mask.
+        # 9. Build the block-diagonal attention mask.
         #
         #    HF's reference uses a varlen FlashAttention path with
         #    cu_seqlens to enforce that token q only attends to
@@ -380,7 +393,7 @@ class Qwen3ASRAudioEncoder(nn.Module):
         attention_mask = op.Or(block_mask, diag_3d)  # (B, S, S) bool
 
         # ----------------------------------------------------------
-        # 9. Encoder layers + post-encoder norm + output projection.
+        # 10. Encoder layers + post-encoder norm + output projection.
         # ----------------------------------------------------------
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, attention_mask)

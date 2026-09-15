@@ -1475,16 +1475,6 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     (
-        "qwen3_omni_moe",
-        {
-            "num_local_experts": 4,
-            "num_experts_per_tok": 2,
-            "moe_intermediate_size": TINY_INTERMEDIATE,
-            "attn_qk_norm": True,
-        },
-        False,
-    ),
-    (
         "qwen3_vl_moe",
         {
             "num_local_experts": 4,
@@ -3630,6 +3620,31 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "attn_qk_norm": True,
             "mrope_section": [24, 20, 20],
             "mrope_interleaved": True,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=128,
+                max_source_positions=256,
+                downsample_hidden_size=32,
+                output_dim=64,
+                audio_token_id=100,
+            ),
+        },
+        True,
+    ),
+    # --- Qwen3-Omni thinker (speech-language, Qwen3-ASR audio encoder + MoE decoder) ---
+    (
+        "qwen3_omni_moe",
+        {
+            "attn_qk_norm": True,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "norm_topk_prob": True,
             "audio": AudioConfig(
                 d_model=64,
                 encoder_layers=2,
