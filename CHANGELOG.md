@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package (`audio_encoder` / `embedding` / `decoder`): the Qwen3-ASR audio
   encoder, audio-token feature fusion, and a QK-norm MoE decoder with
   interleaved MRoPE. The vision tower, talker, and code2wav are not exported.
+- Routed experts emit one `com.microsoft::MoE` node per layer on EPs that
+  support it, with expert-major weights stacked at export time. The portable
+  loop-over-experts graph (three initializers and a GEMM per expert per layer)
+  remains the fallback; for the 30B checkpoint it made ONNX Runtime spend ~20
+  minutes of session initialisation on 18k expert tensors.
 
 #### Fixed
 

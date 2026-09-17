@@ -27,6 +27,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
     Linear,
@@ -34,6 +35,7 @@ from mobius.components import (
     SoftmaxTopKGate,
     initialize_rope,
 )
+from mobius.components._moe import _realize_gate_and_get_qmoe_routing
 from mobius.models.moe import MoEDecoderLayer, _rename_moe_expert_weights
 from mobius.models.qwen3_asr import (
     Qwen3ASRAudioEncoder,
@@ -44,6 +46,152 @@ from mobius.models.qwen3_asr import (
 # Checkpoint prefixes of components outside the thinker's audio + text path.
 _DROPPED_PREFIXES = ("talker.", "code2wav.")
 _DROPPED_THINKER_PREFIXES = ("visual.",)
+
+
+def _use_fused_moe(config: ArchitectureConfig) -> bool:
+    """Whether to emit one ``com.microsoft::MoE`` node per layer.
+
+    The loop-over-experts fallback materialises ``3 * num_local_experts``
+    initializers and as many GEMMs per layer (18k tensors / 87k nodes for the
+    30B checkpoint), which dominates session initialisation. Quantized
+    checkpoints keep the QMoE path in :class:`~mobius.components.MoELayer`.
+    """
+    quantization = getattr(config, "quantization", None)
+    if quantization is not None and quantization.quant_method != "none":
+        return False
+    return ep_capabilities().supports_fused_moe
+
+
+def _interleave_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
+    """``[..., 2 * inter, hidden]`` gate-then-up rows → ``swiglu_fusion=1`` order.
+
+    The fused kernel expects ``[g_0, u_0, g_1, u_1, ...]``. Interleaving here
+    rather than in the graph keeps the 60 GB of expert weights out of ORT's
+    constant folding at session load.
+    """
+    experts, fc1_out, hidden = gate_up.shape
+    return (
+        gate_up.reshape(experts, 2, fc1_out // 2, hidden)
+        .transpose(1, 2)
+        .reshape(experts, fc1_out, hidden)
+    )
+
+
+def _stack_expert_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rewrite HF expert weights into the fused MoE node's two parameters.
+
+    Accepts both checkpoint layouts: the fused ``experts.gate_up_proj`` /
+    ``experts.down_proj`` tensors that transformers produces, and the
+    per-expert ``experts.{i}.{gate,up,down}_proj.weight`` tensors the released
+    safetensors ship. Consumed entries are dropped as they are stacked so the
+    per-expert copies do not stay resident.
+    """
+    per_expert: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+    stacked: dict[str, torch.Tensor] = {}
+    for key in list(state_dict):
+        if ".mlp.experts." not in key:
+            continue
+        prefix, _, suffix = key.partition(".mlp.experts.")
+        if suffix.startswith("gate_up_proj"):
+            stacked[f"{prefix}.mlp.fc1_experts_weights"] = _interleave_gate_up(
+                state_dict.pop(key)
+            )
+        elif suffix.startswith("down_proj"):
+            stacked[f"{prefix}.mlp.fc2_experts_weights"] = state_dict.pop(key)
+        else:
+            index, _, projection = suffix.partition(".")
+            if not index.isdigit():
+                continue
+            projection = projection.removesuffix(".weight")
+            per_expert.setdefault(prefix, {}).setdefault(int(index), {})[projection] = (
+                state_dict.pop(key)
+            )
+
+    for prefix, experts in per_expert.items():
+        order = sorted(experts)
+        gate_up = torch.stack(
+            [
+                torch.stack([experts[i]["gate_proj"], experts[i]["up_proj"]], dim=1).reshape(
+                    -1, experts[i]["gate_proj"].shape[-1]
+                )
+                for i in order
+            ]
+        )
+        stacked[f"{prefix}.mlp.fc1_experts_weights"] = gate_up
+        stacked[f"{prefix}.mlp.fc2_experts_weights"] = torch.stack(
+            [experts[i]["down_proj"] for i in order]
+        )
+        experts.clear()
+
+    state_dict.update(stacked)
+    return state_dict
+
+
+class Qwen3OmniFusedMoE(nn.Module):
+    """Routed experts of one decoder layer as a single fused MoE node.
+
+    Expert weights are stored expert-major, matching the fused HF layout:
+    ``fc1_experts_weights`` ``[E, 2 * moe_inter, hidden]`` with gate/up rows
+    already interleaved for ``swiglu_fusion=1`` (see
+    :meth:`Qwen3OmniThinkerForConditionalGeneration.preprocess_weights`), and
+    ``fc2_experts_weights`` ``[E, hidden, moe_inter]``.
+
+    The op's SwiGLU defaults (``activation_alpha=1.0``, ``activation_beta=0``,
+    no clamp) are exactly Qwen3's ``silu(gate) * up``, so they are left unset.
+    """
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        assert config.moe_intermediate_size is not None
+        self.gate = gate
+        self._hidden_size = config.hidden_size
+        self._top_k = config.num_experts_per_tok
+        self.fc1_experts_weights = nn.Parameter(
+            [config.num_local_experts, 2 * config.moe_intermediate_size, config.hidden_size]
+        )
+        self.fc2_experts_weights = nn.Parameter(
+            [config.num_local_experts, config.hidden_size, config.moe_intermediate_size]
+        )
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        hidden_2d = op.Reshape(
+            hidden_states, op.Constant(value_ints=[-1, self._hidden_size])
+        )  # (batch * seq, hidden)
+        # ``router_probs`` takes the raw logits: the kernel applies
+        # softmax → top-k → optional renormalisation itself.
+        router_logits, _routing_probs, normalize, routed_scaling = (
+            _realize_gate_and_get_qmoe_routing(op, self.gate, hidden_2d)
+        )
+        # CastLike restores the input dtype: op.MoE is a contrib op whose
+        # output carries no type, which would break downstream inference.
+        expert_out = op.CastLike(
+            op.MoE(  # type: ignore[attr-defined]
+                hidden_2d,
+                router_logits,
+                self.fc1_experts_weights,
+                None,  # fc1_experts_bias
+                self.fc2_experts_weights,
+                activation_type="swiglu",
+                k=self._top_k,
+                normalize_routing_weights=int(normalize),
+                swiglu_fusion=1,
+                _domain="com.microsoft",
+            ),
+            hidden_2d,
+        )
+        if routed_scaling != 1.0:  # noqa: RUF069
+            expert_out = op.Mul(expert_out, op.CastLike(routed_scaling, expert_out))
+        return op.Reshape(expert_out, op.Shape(hidden_states))
+
+
+class Qwen3OmniDecoderLayer(MoEDecoderLayer):
+    """Pre-norm decoder layer whose routed experts use the fused MoE node."""
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
+        super().__init__(config, gate=gate, **kwargs)
+        self.mlp = Qwen3OmniFusedMoE(config, gate=gate)
 
 
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
@@ -65,9 +213,10 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
                 "Qwen3-Omni decoder requires num_local_experts and num_experts_per_tok"
             )
         self._dtype = config.dtype
+        layer_class = Qwen3OmniDecoderLayer if _use_fused_moe(config) else MoEDecoderLayer
         self.layers = nn.ModuleList(
             [
-                MoEDecoderLayer(
+                layer_class(
                     config,
                     gate=SoftmaxTopKGate(
                         config.hidden_size,
@@ -109,6 +258,7 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
+        self._fused_moe = _use_fused_moe(config)
         self.audio_tower = Qwen3ASRAudioEncoder(config)
         self.embedding = Qwen3ASREmbeddingModel(config)
         self.decoder = Qwen3OmniThinkerDecoderModel(config)
@@ -142,8 +292,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
         - ``thinker.audio_tower.*`` → ``audio_tower.*``
         - ``thinker.model.embed_tokens.*`` → ``embedding.embed_tokens.*``
         - ``thinker.model.{layers,norm}.*`` → ``decoder.{layers,norm}.*``
-          (fused ``experts.gate_up_proj`` / ``experts.down_proj`` are split
-          per expert)
+          (expert weights are stacked for the fused MoE node, or split per
+          expert for the loop fallback)
         - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
         """
         thinker_state: dict[str, torch.Tensor] = {}
@@ -154,7 +304,10 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
             if key.startswith(_DROPPED_THINKER_PREFIXES):
                 continue
             thinker_state[key] = value
-        thinker_state = _rename_moe_expert_weights(thinker_state)
+        if self._fused_moe:
+            thinker_state = _stack_expert_weights(thinker_state)
+        else:
+            thinker_state = _rename_moe_expert_weights(thinker_state)
 
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in thinker_state.items():

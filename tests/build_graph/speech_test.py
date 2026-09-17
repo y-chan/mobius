@@ -883,8 +883,9 @@ class TestBuildGraphQwen3Omni:
         assert _default_task_for_model("qwen3_omni_moe") == "speech-language"
 
     def test_decoder_is_moe(self):
-        """Every decoder layer routes through a top-k gate; the encoder shares Qwen3-ASR's IO."""
-        _, pkg = self._build(self._omni_config())
+        """Each layer's experts are one fused MoE node; the encoder shares Qwen3-ASR's IO."""
+        config = self._omni_config()
+        _, pkg = self._build(config)
 
         assert {inp.name for inp in pkg["audio_encoder"].graph.inputs} == {
             "input_features",
@@ -894,52 +895,84 @@ class TestBuildGraphQwen3Omni:
         assert {"inputs_embeds", "attention_mask", "position_ids"} <= {
             inp.name for inp in decoder.graph.inputs
         }
+        moe_nodes = [
+            n
+            for n in decoder.graph.all_nodes()
+            if n.op_type == "MoE" and n.domain == "com.microsoft"
+        ]
+        assert len(moe_nodes) == TINY_LAYERS
+        # Two expert tensors per layer instead of three per expert: the
+        # per-expert unroll is what makes session init dominate load time.
+        expert_initializers = [n for n in decoder.graph.initializers if ".mlp." in n]
+        assert len(expert_initializers) == 3 * TINY_LAYERS  # fc1, fc2, gate
+
+    def test_decoder_falls_back_without_fused_moe(self, monkeypatch):
+        """EPs without a fused MoE kernel keep the portable loop-over-experts graph."""
+        import mobius.models.qwen3_omni as qwen3_omni
+
+        monkeypatch.setattr(qwen3_omni, "_use_fused_moe", lambda config: False)
+        config = self._omni_config()
+        module = Qwen3OmniThinkerForConditionalGeneration(config)
+        decoder = build_from_module(module, config, task=SpeechLanguageTask())["decoder"]
+
+        assert not [n for n in decoder.graph.all_nodes() if n.op_type == "MoE"]
         topk_nodes = [n for n in decoder.graph.all_nodes() if n.op_type == "TopK"]
         assert len(topk_nodes) == TINY_LAYERS
 
-    def test_preprocess_weights_maps_hf_checkpoint_names(self):
+    @pytest.mark.parametrize("layout", ["fused", "per_expert"])
+    def test_preprocess_weights_maps_hf_checkpoint_names(self, layout):
+        """Both released expert layouts collapse onto the fused MoE parameters."""
         config = self._omni_config()
         module = Qwen3OmniThinkerForConditionalGeneration(config)
         num_experts = config.num_local_experts
         inter = config.moe_intermediate_size
         hidden = config.hidden_size
+        gate_up = torch.arange(num_experts * 2 * inter * hidden, dtype=torch.float32).reshape(
+            num_experts, 2 * inter, hidden
+        )
+        down = torch.zeros(num_experts, hidden, inter)
         state_dict = {
             "thinker.audio_tower.ln_post.weight": torch.ones(1),
             "thinker.model.embed_tokens.weight": torch.ones(1),
             "thinker.model.norm.weight": torch.ones(1),
             "thinker.lm_head.weight": torch.ones(1),
             "thinker.model.layers.0.mlp.gate.weight": torch.ones(1),
-            "thinker.model.layers.0.mlp.experts.gate_up_proj": torch.zeros(
-                num_experts, 2 * inter, hidden
-            ),
-            "thinker.model.layers.0.mlp.experts.down_proj": torch.zeros(
-                num_experts, hidden, inter
-            ),
             "thinker.visual.merger.ln_q.weight": torch.ones(1),
             "talker.model.norm.weight": torch.ones(1),
             "code2wav.pre_transformer.norm.weight": torch.ones(1),
         }
+        prefix = "thinker.model.layers.0.mlp.experts"
+        if layout == "fused":
+            state_dict[f"{prefix}.gate_up_proj"] = gate_up
+            state_dict[f"{prefix}.down_proj"] = down
+        else:
+            # Released safetensors keep one tensor per expert and projection.
+            for i in range(num_experts):
+                state_dict[f"{prefix}.{i}.gate_proj.weight"] = gate_up[i, :inter]
+                state_dict[f"{prefix}.{i}.up_proj.weight"] = gate_up[i, inter:]
+                state_dict[f"{prefix}.{i}.down_proj.weight"] = down[i]
 
         cleaned = module.preprocess_weights(state_dict)
 
-        expected = {
+        assert set(cleaned) == {
             "audio_tower.ln_post.weight",
             "embedding.embed_tokens.weight",
             "decoder.norm.weight",
             "decoder.lm_head.weight",
             "decoder.layers.0.mlp.gate.weight",
+            "decoder.layers.0.mlp.fc1_experts_weights",
+            "decoder.layers.0.mlp.fc2_experts_weights",
         }
-        for i in range(num_experts):
-            expected |= {
-                f"decoder.layers.0.mlp.experts.{i}.gate_proj.weight",
-                f"decoder.layers.0.mlp.experts.{i}.up_proj.weight",
-                f"decoder.layers.0.mlp.experts.{i}.down_proj.weight",
-            }
-        assert set(cleaned) == expected
-        assert cleaned["decoder.layers.0.mlp.experts.0.gate_proj.weight"].shape == (
-            inter,
+        fc1 = cleaned["decoder.layers.0.mlp.fc1_experts_weights"]
+        assert fc1.shape == (num_experts, 2 * inter, hidden)
+        assert cleaned["decoder.layers.0.mlp.fc2_experts_weights"].shape == (
+            num_experts,
             hidden,
+            inter,
         )
+        # swiglu_fusion=1 wants [g_0, u_0, g_1, u_1, ...] rows.
+        torch.testing.assert_close(fc1[:, 0::2], gate_up[:, :inter])
+        torch.testing.assert_close(fc1[:, 1::2], gate_up[:, inter:])
 
     def test_3model_pipeline_runs_with_ort(self):
         config = self._omni_config()
