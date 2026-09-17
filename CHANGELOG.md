@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoints (e.g. int8 experts with bf16 everything else) load unchanged.
 - `supported_qmoe_quantization` accepts symmetric int8 in addition to int4.
   Asymmetric int8 still falls back, as its zero-point layout is unvalidated.
+- `--features static-cache` now applies to speech-language models (Qwen3-ASR,
+  Qwen3-Omni): the decoder takes pre-allocated `key_cache.{i}` /
+  `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
+  instead of growing `past_key_values` and `attention_mask`, so single-token
+  decode steps have fixed shapes and can be replayed from a CUDA graph.
 
 #### Fixed
 

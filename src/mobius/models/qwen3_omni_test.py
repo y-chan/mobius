@@ -350,3 +350,80 @@ def test_partially_float_attention_is_rejected():
     config = ArchitectureConfig.from_transformers(primary, parent_config=parent)
     with pytest.raises(ValueError, match="every layer"):
         Qwen3OmniThinkerForConditionalGeneration(config)
+
+
+# ---------------------------------------------------------------------------
+# Static KV cache decoder (fixed shapes for CUDA graph capture)
+# ---------------------------------------------------------------------------
+
+_STATIC_MAX_SEQ_LEN = 64
+
+
+def test_static_cache_decoder_matches_dynamic(omni):
+    """Prefill + decode through pre-allocated KV buffers equals the growing-cache graph."""
+    config, hf_model, dynamic_package = omni
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    static_package = build_from_module(
+        module,
+        config,
+        task=SpeechLanguageTask(static_cache=True, max_seq_len=_STATIC_MAX_SEQ_LEN),
+    )
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+    static_package.apply_weights(module.preprocess_weights(state_dict))
+
+    static_inputs = {i.name for i in static_package["decoder"].graph.inputs}
+    assert "attention_mask" not in static_inputs
+    assert {"write_indices", "nonpad_kv_seqlen", "key_cache.0"} <= static_inputs
+
+    rng = np.random.default_rng(3)
+    prompt = rng.standard_normal((1, 6, config.hidden_size)).astype(np.float32)
+    steps = [prompt] + [
+        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float32) for _ in range(4)
+    ]
+    layers = range(config.num_hidden_layers)
+    kv_hidden = config.num_key_value_heads * config.head_dim
+    dynamic_past = {
+        f"past_key_values.{i}.{kind}": np.zeros(
+            (1, config.num_key_value_heads, 0, config.head_dim), np.float32
+        )
+        for i in layers
+        for kind in ("key", "value")
+    }
+    static_cache = {
+        f"{kind}_cache.{i}": np.zeros((1, _STATIC_MAX_SEQ_LEN, kv_hidden), np.float32)
+        for i in layers
+        for kind in ("key", "value")
+    }
+    past_len = 0
+    for embeds in steps:
+        seq = embeds.shape[1]
+        pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+        position_ids = np.stack([pos, pos, pos])[:, None, :]
+        dynamic_out = _run(
+            dynamic_package["decoder"],
+            {
+                "inputs_embeds": embeds,
+                "attention_mask": np.ones((1, past_len + seq), np.int64),
+                "position_ids": position_ids,
+                **dynamic_past,
+            },
+        )
+        static_out = _run(
+            static_package["decoder"],
+            {
+                "inputs_embeds": embeds,
+                "position_ids": position_ids,
+                "write_indices": np.array([past_len], np.int64),
+                "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+                **static_cache,
+            },
+        )
+        np.testing.assert_allclose(
+            static_out["logits"], dynamic_out["logits"], rtol=1e-5, atol=1e-5
+        )
+        dynamic_past = {
+            name: dynamic_out[name.replace("past_key_values.", "present.")]
+            for name in dynamic_past
+        }
+        static_cache = {name: static_out[f"updated_{name}"] for name in static_cache}
+        past_len += seq
