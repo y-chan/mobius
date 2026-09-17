@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 
@@ -194,3 +195,158 @@ def test_three_stage_matches_hf_thinker(omni):
         },
     )
     np.testing.assert_allclose(decoder_out["logits"], hf_logits, rtol=2e-4, atol=2e-4)
+
+
+# ---------------------------------------------------------------------------
+# Expert-only int8 checkpoints (QMoE)
+# ---------------------------------------------------------------------------
+
+_INT8_BLOCK = 32
+
+
+def _quantize_int8_block(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric int8 with one fp32 absmax scale per ``_INT8_BLOCK`` inputs.
+
+    Blocks run along the last (input) dimension, as in SoulX-Transcriber's
+    ``make_int8_base32.py``. Returns ``(int8 [..., out, in], scale [..., out, n_blocks])``.
+    """
+    blocks = weight.float().reshape(-1, _INT8_BLOCK)
+    scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 127.0
+    q = torch.round(blocks / scale).clamp_(-127, 127).to(torch.int8).reshape(weight.shape)
+    return q, scale.reshape(*weight.shape[:-1], -1)
+
+
+def _dequantize_int8_block(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return (q.float().reshape(*scale.shape, _INT8_BLOCK) * scale.unsqueeze(-1)).reshape(
+        q.shape
+    )
+
+
+def _int8_expert_checkpoint(hf_model, num_layers: int) -> tuple[dict, dict]:
+    """Olive-layout state dict with int8 experts; the HF model gets the dequantized experts.
+
+    Returns ``(state_dict, quantization_config)``. Mutating the HF experts to
+    their dequantized values makes it the exact float reference for the
+    QMoE graph, so any mismatch comes from the export, not from rounding.
+    """
+    quantization_config = {
+        "quant_method": "olive",
+        "bits": 8,
+        "group_size": _INT8_BLOCK,
+        "sym": True,
+        "modules_to_not_convert": [
+            f"thinker.model.layers.{i}.self_attn" for i in range(num_layers)
+        ],
+    }
+    state_dict = {}
+    with torch.no_grad():
+        for i, layer in enumerate(hf_model.model.layers):
+            for name in ("gate_up_proj", "down_proj"):
+                param = getattr(layer.mlp.experts, name)
+                q, scale = _quantize_int8_block(param)
+                param.copy_(_dequantize_int8_block(q, scale))
+                prefix = f"thinker.model.layers.{i}.mlp.experts.{name}"
+                # Olive stores symmetric int8 as uint8 with an implicit zero point of 128.
+                state_dict[f"{prefix}_qweight"] = (q.to(torch.int16) + 128).to(torch.uint8)
+                state_dict[f"{prefix}_scales"] = scale
+        for key, value in hf_model.state_dict().items():
+            if ".mlp.experts." not in key:
+                state_dict[f"thinker.{key}"] = value.detach()
+    return state_dict, quantization_config
+
+
+@pytest.fixture(scope="module")
+def omni_int8():
+    hf_config, hf_model = _tiny_hf_model()
+    num_layers = hf_config.thinker_config.text_config.num_hidden_layers
+    state_dict, quantization_config = _int8_expert_checkpoint(hf_model, num_layers)
+    hf_config.quantization_config = quantization_config
+    primary, parent, _ = _select_primary_config(hf_config)
+    config = ArchitectureConfig.from_transformers(primary, parent_config=parent)
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=SpeechLanguageTask())
+    package.apply_weights(module.preprocess_weights(state_dict))
+    return config, hf_model, package
+
+
+def test_int8_experts_use_qmoe_with_float_attention(omni_int8):
+    config, _, package = omni_int8
+    assert config.quantization.bits == 8
+    graph = package["decoder"].graph
+    qmoe = [n for n in graph.all_nodes() if n.op_type == "QMoE"]
+    assert len(qmoe) == config.num_hidden_layers
+    assert {n.attributes["expert_weight_bits"].value for n in qmoe} == {8}
+    assert {n.attributes["block_size"].value for n in qmoe} == {_INT8_BLOCK}
+    # Attention stays float: no MatMulNBits anywhere in the decoder.
+    assert not [n for n in graph.all_nodes() if n.op_type == "MatMulNBits"]
+    assert (
+        graph.initializers["decoder.layers.0.mlp.fc1_experts_weights"].dtype
+        == ir.DataType.UINT8
+    )
+
+
+def test_int8_experts_match_dequantized_hf(omni_int8):
+    config, hf_model, package = omni_int8
+    rng = np.random.default_rng(1)
+    mel_len = 200
+    input_features = rng.standard_normal((1, _NUM_MEL_BINS, mel_len)).astype(np.float32)
+    feature_attention_mask = np.ones((1, mel_len), dtype=np.int64)
+    audio_out = _run(
+        package["audio_encoder"],
+        {"input_features": input_features, "feature_attention_mask": feature_attention_mask},
+    )
+    num_audio_tokens = int(audio_out["audio_feature_lengths"][0])
+    audio_features = audio_out["audio_features"][0, :num_audio_tokens]
+    input_ids = np.array(
+        [[1, 2, *([_AUDIO_TOKEN_ID] * num_audio_tokens), 3, 4]], dtype=np.int64
+    )
+    inputs_embeds = _run(
+        package["embedding"], {"input_ids": input_ids, "audio_features": audio_features}
+    )["inputs_embeds"]
+    seq_len = input_ids.shape[1]
+    attention_mask = np.ones_like(input_ids)
+    pos = np.arange(seq_len, dtype=np.int64)
+    position_ids = np.stack([pos, pos, pos])[:, None, :]
+
+    with torch.no_grad():
+        hf_logits = hf_model(
+            input_ids=torch.from_numpy(input_ids),
+            input_features=torch.from_numpy(input_features),
+            feature_attention_mask=torch.from_numpy(feature_attention_mask),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+            use_cache=False,
+        ).logits.numpy()
+
+    kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+    decoder_out = _run(
+        package["decoder"],
+        {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            **{
+                f"past_key_values.{i}.{kind}": np.zeros(kv_shape, dtype=np.float32)
+                for i in range(config.num_hidden_layers)
+                for kind in ("key", "value")
+            },
+        },
+    )
+    # Correct layouts land ~1e-7 apart; a gate/up row swap is ~5e-3 and a 5%
+    # scale error ~1e-3, so this bound separates them with margin.
+    np.testing.assert_allclose(decoder_out["logits"], hf_logits, rtol=1e-5, atol=1e-5)
+
+
+def test_partially_float_attention_is_rejected():
+    hf_config, _ = _tiny_hf_model()
+    hf_config.quantization_config = {
+        "quant_method": "olive",
+        "bits": 8,
+        "group_size": _INT8_BLOCK,
+        "sym": True,
+        "modules_to_not_convert": ["thinker.model.layers.0.self_attn"],
+    }
+    primary, parent, _ = _select_primary_config(hf_config)
+    config = ArchitectureConfig.from_transformers(primary, parent_config=parent)
+    with pytest.raises(ValueError, match="every layer"):
+        Qwen3OmniThinkerForConditionalGeneration(config)

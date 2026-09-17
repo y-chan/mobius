@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop-over-experts graph (three initializers and a GEMM per expert per layer)
   remains the fallback; for the 30B checkpoint it made ONNX Runtime spend ~20
   minutes of session initialisation on 18k expert tensors.
+- Olive-layout checkpoints with symmetric int8 routed experts export through
+  `com.microsoft::QMoE` (`expert_weight_bits=8`). When
+  `quantization_config.modules_to_not_convert` lists every layer's
+  `self_attn`, attention keeps float projections, so expert-only int8
+  checkpoints (e.g. int8 experts with bf16 everything else) load unchanged.
+- `supported_qmoe_quantization` accepts symmetric int8 in addition to int4.
+  Asymmetric int8 still falls back, as its zero-point layout is unvalidated.
 
 #### Fixed
 

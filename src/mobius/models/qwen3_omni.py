@@ -29,7 +29,9 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
+    Attention,
     Linear,
     RMSNorm,
     SoftmaxTopKGate,
@@ -48,6 +50,49 @@ _DROPPED_PREFIXES = ("talker.", "code2wav.")
 _DROPPED_THINKER_PREFIXES = ("visual.",)
 
 
+def _is_quantized(config: ArchitectureConfig) -> bool:
+    quantization = getattr(config, "quantization", None)
+    return quantization is not None and quantization.quant_method != "none"
+
+
+def _float_attention_in_quantized_checkpoint(config: ArchitectureConfig) -> bool:
+    """Whether a quantized checkpoint keeps every layer's attention in float.
+
+    Expert-only checkpoints (e.g. int8 routed experts with bf16 everything
+    else) declare the float modules in ``quantization_config.modules_to_not_convert``
+    using HF root-relative names (``thinker.model.layers.{i}.self_attn``). The
+    routed experts then go through QMoE while attention keeps plain ``Linear``
+    projections. Checkpoints that list nothing quantize attention as well.
+    Mixed per-layer plans are rejected rather than guessed.
+    """
+    names = config.quantization.modules_to_not_convert or ()
+    if any(name.startswith("re:") for name in names):
+        raise NotImplementedError(
+            "Qwen3-Omni does not resolve regex modules_to_not_convert rules; "
+            "list the float modules explicitly."
+        )
+    names = tuple(name.removeprefix("thinker.") for name in names)
+
+    def excluded(path: str) -> bool:
+        return any(path == name or path.startswith(f"{name}.") for name in names)
+
+    layers = range(config.num_hidden_layers)
+    if any(excluded(f"model.layers.{i}.mlp.experts") for i in layers):
+        raise ValueError(
+            "Qwen3-Omni quantized checkpoints must quantize the routed experts; "
+            "modules_to_not_convert excludes them."
+        )
+    float_attention = [excluded(f"model.layers.{i}.self_attn") for i in layers]
+    if all(float_attention):
+        return True
+    if any(float_attention):
+        raise ValueError(
+            "Qwen3-Omni quantized checkpoints must keep attention either float in "
+            "every layer or quantized in every layer."
+        )
+    return False
+
+
 def _use_fused_moe(config: ArchitectureConfig) -> bool:
     """Whether to emit one ``com.microsoft::MoE`` node per layer.
 
@@ -56,8 +101,7 @@ def _use_fused_moe(config: ArchitectureConfig) -> bool:
     30B checkpoint), which dominates session initialisation. Quantized
     checkpoints keep the QMoE path in :class:`~mobius.components.MoELayer`.
     """
-    quantization = getattr(config, "quantization", None)
-    if quantization is not None and quantization.quant_method != "none":
+    if _is_quantized(config):
         return False
     return ep_capabilities().supports_fused_moe
 
@@ -194,6 +238,19 @@ class Qwen3OmniDecoderLayer(MoEDecoderLayer):
         self.mlp = Qwen3OmniFusedMoE(config, gate=gate)
 
 
+class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
+    """Decoder layer for expert-only quantized checkpoints.
+
+    :class:`MoEDecoderLayer` quantizes attention whenever the config carries a
+    quantization; here only the routed experts (QMoE) are quantized and the
+    attention projections stay float.
+    """
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
+        super().__init__(config, gate=gate, **kwargs)
+        self.self_attn = Attention(config)
+
+
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
     """Qwen3-Omni thinker text decoder: inputs_embeds → logits + KV cache.
 
@@ -213,7 +270,12 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
                 "Qwen3-Omni decoder requires num_local_experts and num_experts_per_tok"
             )
         self._dtype = config.dtype
-        layer_class = Qwen3OmniDecoderLayer if _use_fused_moe(config) else MoEDecoderLayer
+        if _use_fused_moe(config):
+            layer_class = Qwen3OmniDecoderLayer
+        elif _is_quantized(config) and _float_attention_in_quantized_checkpoint(config):
+            layer_class = Qwen3OmniQuantizedExpertsDecoderLayer
+        else:
+            layer_class = MoEDecoderLayer
         self.layers = nn.ModuleList(
             [
                 layer_class(
@@ -304,10 +366,13 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
             if key.startswith(_DROPPED_THINKER_PREFIXES):
                 continue
             thinker_state[key] = value
+        quantized = _is_quantized(self.config)
         if self._fused_moe:
             thinker_state = _stack_expert_weights(thinker_state)
-        else:
+        elif not quantized:
             thinker_state = _rename_moe_expert_weights(thinker_state)
+        # Quantized checkpoints keep Olive's fused expert-major tensors
+        # (``experts.gate_up_proj_qweight`` ...) for the QMoE packer below.
 
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in thinker_state.items():
@@ -328,6 +393,17 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
 
         embed_key = "embedding.embed_tokens.weight"
         lm_key = "decoder.lm_head.weight"
+        if quantized:
+            return preprocess_quantized_weights(
+                cleaned,
+                self.config.quantization,
+                tie_embeddings=self.config.tie_word_embeddings,
+                embed_key=embed_key,
+                head_key=lm_key,
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                reject_quantized_embeddings_lm_head=True,
+            )
         if self.config.tie_word_embeddings:
             if embed_key in cleaned and lm_key not in cleaned:
                 cleaned[lm_key] = cleaned[embed_key]

@@ -23,6 +23,7 @@ from mobius._weight_utils import (
     split_interleaved_qkv,
     stack_per_expert_moe_weights,
     strip_prefix,
+    supported_qmoe_quantization,
     tie_word_embeddings,
     vlm_decoder_weights,
     vlm_embedding_weights,
@@ -959,7 +960,10 @@ class TestPreprocessQuantizedWeights:
         ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
     )
     def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix):
-        quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
+        # Asymmetric int8 is outside the validated QMoE ABI (symmetric int8 is inside).
+        quantization = QuantizationConfig(
+            bits=8, group_size=16, quant_method="olive", sym=False
+        )
         state_dict = {
             f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
         }
@@ -970,6 +974,22 @@ class TestPreprocessQuantizedWeights:
                 quantization,
                 qmoe_target_path=".mlp",
             )
+
+    @pytest.mark.parametrize(
+        ("bits", "sym", "supported"),
+        [
+            (4, True, True),
+            (4, False, True),
+            (8, True, True),
+            (8, False, False),
+            (2, True, False),
+        ],
+    )
+    def test_supported_qmoe_bit_widths(self, bits, sym, supported):
+        quantization = QuantizationConfig(
+            bits=bits, group_size=32, quant_method="olive", sym=sym
+        )
+        assert (supported_qmoe_quantization(quantization) is not None) is supported
 
     def test_rejects_unsupported_qmoe_quantization_method(self):
         quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
