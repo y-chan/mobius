@@ -35,6 +35,7 @@ from mobius.components import (
     Linear,
     RMSNorm,
     SoftmaxTopKGate,
+    TransposedLinear,
     initialize_rope,
 )
 from mobius.components._moe import _realize_gate_and_get_qmoe_routing
@@ -280,7 +281,7 @@ class Qwen3OmniDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
-        self.self_attn = FusedQKVAttention(config)
+        self.self_attn = FusedQKVAttention(config, linear_class=TransposedLinear)
         self.mlp = Qwen3OmniFusedMoE(config, gate=gate)
 
 
@@ -294,7 +295,7 @@ class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
-        self.self_attn = FusedQKVAttention(config)
+        self.self_attn = FusedQKVAttention(config, linear_class=TransposedLinear)
 
 
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):

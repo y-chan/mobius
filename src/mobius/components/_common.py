@@ -7,6 +7,8 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
+
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
 
@@ -33,6 +35,35 @@ class Linear(nn.Module):
         # pre-compute this transpose and eliminate the runtime Transpose node.
         w_t = op.Transpose(self.weight, perm=[1, 0])
         result = op.MatMul(x, w_t)
+        if self.bias is not None:
+            result = op.Add(result, self.bias)
+        return result
+
+
+class TransposedLinear(Linear):
+    """Linear that hands cuBLAS the checkpoint's ``[out, in]`` weight as-is.
+
+    :class:`Linear` pre-transposes the weight so a plain ``MatMul`` computes
+    ``x @ weight.T``. The resulting ``[in, out]`` layout is the slower one for
+    cuBLAS at batch 1: measured on an RTX PRO 6000, a ``[1, 2048] x
+    [2048, 5120]`` projection takes 48 us that way against 33 us when the
+    weight stays ``[out, in]`` and the transpose is folded into the GEMM.
+
+    ``com.microsoft::FusedMatMul`` is the op that carries ``transB``; unlike
+    ``Gemm`` it accepts rank > 2, which is what a decoder layer feeds. It is an
+    ORT contrib op with no ONNX function body, so EPs that cannot run it fall
+    back to :class:`Linear`'s ``MatMul``. The parameter is the same either way,
+    so the choice is made here in ``forward`` rather than at construction:
+    models are instantiated before :func:`~mobius._build_context.build_context`
+    is entered, where ``ep_capabilities()`` still reports the defaults.
+    """
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        if not ep_capabilities().supports_transposed_matmul:
+            return super().forward(op, x)
+        result = op.FusedMatMul(  # type: ignore[attr-defined]
+            x, self.weight, alpha=1.0, transB=1, _domain="com.microsoft"
+        )
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result

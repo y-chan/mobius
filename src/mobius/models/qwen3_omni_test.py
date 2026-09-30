@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
 
+from mobius._build_context import build_context
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
+from mobius._execution_providers import EpCapabilities
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.transformers._builder import _select_primary_config
 from mobius.models.qwen3_omni import Qwen3OmniThinkerForConditionalGeneration
@@ -427,3 +431,54 @@ def test_static_cache_decoder_matches_dynamic(omni):
         }
         static_cache = {name: static_out[f"updated_{name}"] for name in static_cache}
         past_len += seq
+
+
+def test_transposed_attention_projections_match_plain(omni):
+    """FusedMatMul(transB) projections compute what the pre-transposed MatMul does."""
+    config, hf_model, plain_package = omni
+    # One flag apart from the fixture's build, so the projections are the only
+    # difference between the two graphs. The module is constructed outside the
+    # context the way the builder does it, so a capability read at __init__
+    # time -- which would see the defaults there -- cannot pass this.
+    capabilities = dataclasses.replace(
+        EpCapabilities(name="default"), supports_transposed_matmul=True
+    )
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    with build_context(capabilities):
+        package = SpeechLanguageTask().build(module, config)
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+    package.apply_weights(module.preprocess_weights(state_dict))
+
+    decoder = package["decoder"]
+    fused = [n for n in decoder.graph.all_nodes() if n.op_type == "FusedMatMul"]
+    # qkv_proj and o_proj per layer; the router gate and LM head stay MatMul.
+    assert len(fused) == 2 * config.num_hidden_layers
+    for node in fused:
+        assert node.attributes["transB"].as_int() == 1
+        # The weight keeps the checkpoint's [out, in] shape: nothing transposed it.
+        assert node.inputs[1].shape[1] in (
+            config.hidden_size,
+            config.head_dim * config.num_attention_heads,
+        )
+
+    rng = np.random.default_rng(7)
+    embeds = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float32)
+    pos = np.arange(embeds.shape[1], dtype=np.int64)
+    feeds = {
+        "inputs_embeds": embeds,
+        "attention_mask": np.ones((1, embeds.shape[1]), np.int64),
+        "position_ids": np.stack([pos, pos, pos])[:, None, :],
+        **{
+            f"past_key_values.{i}.{kind}": np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim), np.float32
+            )
+            for i in range(config.num_hidden_layers)
+            for kind in ("key", "value")
+        },
+    }
+    np.testing.assert_allclose(
+        _run(decoder, feeds)["logits"],
+        _run(plain_package["decoder"], feeds)["logits"],
+        rtol=1e-5,
+        atol=1e-5,
+    )
