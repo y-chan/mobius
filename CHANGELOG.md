@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
   instead of growing `past_key_values` and `attention_mask`, so single-token
   decode steps have fixed shapes and can be replayed from a CUDA graph.
+- The thinker's attention reads one packed `[Q | K | V]` projection, joined
+  from the checkpoint's separate tensors at export time, and on EPs that
+  declare `supports_transposed_matmul` (CUDA) emits
+  `com.microsoft::FusedMatMul` with `transB=1` against the checkpoint's
+  `[out, in]` weight rather than `MatMul` against a pre-transposed one. At
+  batch 1 cuBLAS is much faster on that layout: on an RTX PRO 6000 the 30B
+  thinker's decode step went from 8.5 ms to 6.5 ms, the projections
+  themselves from 3.67 ms to 1.58 ms.
 
 #### Fixed
 

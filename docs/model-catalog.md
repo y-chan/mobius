@@ -87,7 +87,7 @@ Models that route tokens to a subset of expert MLPs.
 Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
 `ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,
 `granitemoehybrid`, `granitemoeshared`, `hunyuan_v1_moe`, `jetmoe`,
-`minimax`, `olmoe`, `qwen3_omni_moe`, `qwen3_vl_moe`.
+`minimax`, `olmoe`, `qwen3_vl_moe`.
 
 ## SSM / State-Space Models
 
@@ -189,6 +189,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `qwen3_omni_moe` | `Qwen3OmniThinkerForConditionalGeneration` | `speech-language` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` (thinker only) |
 
 ### Text-to-Speech
 
