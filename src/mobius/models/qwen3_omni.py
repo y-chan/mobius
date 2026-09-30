@@ -31,7 +31,7 @@ from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
-    Attention,
+    FusedQKVAttention,
     Linear,
     RMSNorm,
     SoftmaxTopKGate,
@@ -104,6 +104,51 @@ def _use_fused_moe(config: ArchitectureConfig) -> bool:
     if _is_quantized(config):
         return False
     return ep_capabilities().supports_fused_moe
+
+
+def _use_fused_qkv(config: ArchitectureConfig) -> bool:
+    """Whether the decoder layers take one packed Q/K/V projection.
+
+    Only the two Qwen3-Omni layer classes below do, and both keep attention in
+    float. The generic :class:`~mobius.models.moe.MoEDecoderLayer` fallback
+    quantizes the projections, where packing would mean joining block-quantized
+    weights rather than plain matrices.
+    """
+    return _use_fused_moe(config) or (
+        _is_quantized(config) and _float_attention_in_quantized_checkpoint(config)
+    )
+
+
+def _pack_qkv_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Join each decoder layer's separate Q/K/V projections into one tensor.
+
+    :class:`~mobius.components.FusedQKVAttention` reads ``[Q | K | V]`` rows
+    from a single ``qkv_proj``; the released checkpoints store the three apart.
+    Joining them here turns three ``MatMul`` nodes per layer into one, which on
+    the 48-layer thinker is 96 fewer nodes in every decode step.
+
+    Only ``model.layers.*`` is touched. The audio tower has its own attention
+    with separate projections and must keep them.
+    """
+    packed: dict[str, torch.Tensor] = {}
+    for key in list(state_dict):
+        if not key.startswith("model.layers."):
+            continue
+        prefix, separator, suffix = key.partition(".self_attn.q_proj.")
+        if not separator:
+            continue
+        parts = []
+        for projection in ("q_proj", "k_proj", "v_proj"):
+            part = state_dict.pop(f"{prefix}.self_attn.{projection}.{suffix}", None)
+            if part is None:
+                raise ValueError(
+                    f"{prefix}.self_attn is missing {projection}.{suffix}; "
+                    "the thinker's attention must ship all three projections"
+                )
+            parts.append(part)
+        packed[f"{prefix}.self_attn.qkv_proj.{suffix}"] = torch.cat(parts, dim=0)
+    state_dict.update(packed)
+    return state_dict
 
 
 def _interleave_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
@@ -235,6 +280,7 @@ class Qwen3OmniDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
+        self.self_attn = FusedQKVAttention(config)
         self.mlp = Qwen3OmniFusedMoE(config, gate=gate)
 
 
@@ -248,7 +294,7 @@ class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
-        self.self_attn = Attention(config)
+        self.self_attn = FusedQKVAttention(config)
 
 
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
@@ -355,7 +401,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
         - ``thinker.model.embed_tokens.*`` → ``embedding.embed_tokens.*``
         - ``thinker.model.{layers,norm}.*`` → ``decoder.{layers,norm}.*``
           (expert weights are stacked for the fused MoE node, or split per
-          expert for the loop fallback)
+          expert for the loop fallback; Q/K/V are joined into ``qkv_proj``
+          whenever the layers keep attention in float)
         - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
         """
         thinker_state: dict[str, torch.Tensor] = {}
@@ -367,6 +414,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
                 continue
             thinker_state[key] = value
         quantized = _is_quantized(self.config)
+        if _use_fused_qkv(self.config):
+            thinker_state = _pack_qkv_weights(thinker_state)
         if self._fused_moe:
             thinker_state = _stack_expert_weights(thinker_state)
         elif not quantized:
