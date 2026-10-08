@@ -8,7 +8,10 @@ rather than failing.
 
 Numbers below are the 30B checkpoint with int8 routed experts on an RTX PRO
 6000 Blackwell Max-Q (ORT 1.29, CUDA 12.9), batch 1, a 138-token prompt and
-greedy decoding.
+greedy decoding. The session and loop requirements hold on any CUDA device;
+**the per-kernel timings do not transfer between architectures**, and one of
+the graph-level wins below is specific to Blackwell. Measure on the device you
+serve from before assuming a figure carries over.
 
 ## Build
 
@@ -25,9 +28,16 @@ fusions), and the EP decides two things that matter here:
 - `supports_transposed_matmul` makes the attention projections emit
   `com.microsoft::FusedMatMul` with `transB=1` against the checkpoint's
   `[out, in]` weight. Without it they are a `MatMul` against a pre-transposed
-  `[in, out]` initializer, which at batch 1 is the slow layout for cuBLAS:
-  the 48-layer decode step spends 3.67 ms there instead of 1.58 ms
-  (118 vs 154 tokens/s overall).
+  `[in, out]` initializer, which on Blackwell at batch 1 is the slow layout
+  for cuBLAS: the 48-layer decode step spends 3.67 ms there instead of
+  1.58 ms (118 vs 154 tokens/s overall).
+
+  **This one is architecture-dependent.** On an A100 80GB PCIe (SM80) the two
+  layouts are a wash, because the plain layout is already fast there: per
+  projection, `[1,2048] x [2048,5120]` goes 37.4 → 35.1 µs and
+  `[1,4096] x [4096,2048]` goes 38.1 → 41.0 µs, so the transposed form is a
+  net loss of about 0.6 µs per layer. It costs nothing to leave on, but do not
+  expect the Blackwell figure anywhere else.
 - `supports_fused_moe` keeps one MoE node per layer. The loop-over-experts
   fallback materialises 18k expert tensors for this checkpoint and spends
   about twenty minutes in session initialisation.
@@ -39,8 +49,12 @@ buffers plus `write_indices` and `nonpad_kv_seqlen`, so every single-token
 decode step has one shape.
 
 `--max-seq-len` does not affect decode speed. Attention over the cache is
-latency-bound at batch 1, not bound by the buffer length: 1024 and 4096 slots
-measure the same. Size it for the longest sequence you serve.
+bound by the *valid* KV length, not by the buffer: 1024 and 4096 slots measure
+the same end to end, and 4096 against 8192 slots at a fixed context differ by
+0.002 ms over 48 layers. Size it for the longest sequence you serve. The
+actual context does cost something — on an A100, 170 against 422 past tokens
+is 1.049 against 1.224 ms over 48 layers — so prompt length, not buffer
+length, is what shows up.
 
 ## Session options
 
@@ -138,4 +152,6 @@ captured graph collapses into one range. Two cautions:
   measurable, and replacing `TensorScatter` + `Attention` with
   `com.microsoft::GroupQueryAttention` is slightly *slower* in a graph
   (0.637 ms against 0.608 ms over 48 layers) even though it wins by a wide
-  margin outside one.
+  margin outside one. That verdict is also architecture-dependent: on an A100
+  the same comparison favours GQA in two configurations out of three, by at
+  most 0.12 ms, which is still too little to justify the rework.
