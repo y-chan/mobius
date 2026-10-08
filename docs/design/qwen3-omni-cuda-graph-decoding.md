@@ -152,6 +152,40 @@ captured graph collapses into one range. Two cautions:
   measurable, and replacing `TensorScatter` + `Attention` with
   `com.microsoft::GroupQueryAttention` is slightly *slower* in a graph
   (0.637 ms against 0.608 ms over 48 layers) even though it wins by a wide
-  margin outside one. That verdict is also architecture-dependent: on an A100
-  the same comparison favours GQA in two configurations out of three, by at
-  most 0.12 ms, which is still too little to justify the rework.
+  margin outside one. **That verdict holds only for Blackwell and only for
+  short contexts** — see below.
+
+## GroupQueryAttention and context length (SM80)
+
+The static-cache path costs what the *valid* KV length costs, and how steeply
+depends on the architecture. Measured over 48 layers with an 8192-slot buffer,
+`TensorScatter` + opset-24 `Attention` against `com.microsoft::GroupQueryAttention`
+on the same graph shapes:
+
+| past tokens | Blackwell static | Blackwell GQA | A100 static | A100 GQA |
+|---|---|---|---|---|
+| 170 | 0.753 ms | 0.727 ms | 1.351 ms | 1.369 ms |
+| 422 | 0.799 | 0.790 | 1.530 | 1.420 |
+| 1024 | 0.801 | 0.810 | 1.689 | 1.435 |
+| 2048 | 0.916 | 0.901 | 2.044 | 1.463 |
+| 4096 | 1.011 | 1.007 | 3.039 | 1.596 |
+
+On Blackwell the two are indistinguishable at every length, and both scale
+gently (0.07 µs per token of context). On an A100 the static path scales six
+times more steeply (0.41 µs per token) while GQA stays nearly flat
+(0.05 µs per token), so by 4096 tokens of context GQA is 1.4 ms ahead over the
+48 layers.
+
+This is not an ONNX Runtime regression: 1.29 shows the same shape, with the
+static path steeper still (0.58 µs per token) and GQA at 0.047. ORT 1.30
+improves the static path on SM80 without changing the asymptotics.
+
+So the attention op to emit is a function of the device and of how long the
+prompts are. Short prompts, or Blackwell, and the static path as exported is
+the right choice. Long prompts on SM80 and GQA is worth the rework, which is
+not small: `com.microsoft::GroupQueryAttention` wants its cache in
+`[B, kv_heads, max_seq, head_dim]`, where the static cache uses
+`[B, max_seq, kv_hidden]`, and converting the layout in the graph would copy
+the whole buffer every step. The buffers, their names and the
+`seqlens_k` / `total_seq_len` pair are part of the exported model's contract,
+so changing them is a change to every consumer of a static-cache export.
