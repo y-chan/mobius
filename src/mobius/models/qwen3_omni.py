@@ -15,6 +15,12 @@ Architecture:
 Only the thinker is exported. The vision tower (deepstack), the talker
 and code2wav are out of scope; their weights are dropped.
 
+Decoding this export at speed takes an execution provider, session options
+and a driving loop that the module itself says nothing about -- the graph is
+correct without them, only several times slower, and two of the settings
+corrupt the output rather than failing. See
+``docs/design/qwen3-omni-cuda-graph-decoding.md``.
+
 Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct
 HuggingFace class: Qwen3OmniMoeThinkerForConditionalGeneration
 """

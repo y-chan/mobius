@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
   instead of growing `past_key_values` and `attention_mask`, so single-token
   decode steps have fixed shapes and can be replayed from a CUDA graph.
+- `docs/design/qwen3-omni-cuda-graph-decoding.md` records what the export
+  needs from the build command, the session and the decode loop to run at
+  speed, which settings corrupt the output instead of failing, and why
+  ORT's own profiler cannot be used to break the step down.
 - The thinker's attention reads one packed `[Q | K | V]` projection, joined
   from the checkpoint's separate tensors at export time, and on EPs that
   declare `supports_transposed_matmul` (CUDA) emits

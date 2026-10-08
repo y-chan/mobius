@@ -17,6 +17,7 @@ perf-benchmarking
 phi4mm-architecture
 phi4mm-four-model-split
 phi4mm-ort-genai-integration
+qwen3-omni-cuda-graph-decoding
 sensenova-u1-neo-unify
 test-infrastructure-map
 ```
