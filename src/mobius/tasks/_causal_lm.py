@@ -541,13 +541,20 @@ def _make_static_cache_inputs(
         # GQA wants the last valid index per batch entry and the scalar total,
         # both int32; nonpad_kv_seqlen already carries the length, so the pair
         # is derived once here rather than added to the model's input contract.
+        #
+        # total_sequence_length is the buffer's capacity rather than the live
+        # length on purpose. ORT wants that scalar on the host, so computing it
+        # from nonpad_kv_seqlen would put a device-to-host copy in the decode
+        # step, which a captured CUDA graph cannot hold -- capture then fails.
+        # A constant has no such copy, and it is sound because the op bounds
+        # the KV it reads by seqlens_k: passing the capacity measures the same
+        # (0.744 against 0.720 ms over 48 layers at 170 past tokens, identical
+        # at 4096) and the parity test holds against the TensorScatter path.
         op = builder.op
         seqlens_k = op.Cast(
             op.Sub(nonpad_kv_seqlen, op.Constant(value_int=1)), to=ir.DataType.INT32
         )
-        total_seq_len = op.Cast(
-            op.Gather(nonpad_kv_seqlen, op.Constant(value_int=0)), to=ir.DataType.INT32
-        )
+        total_seq_len = op.Cast(op.Constant(value_int=max_seq_len), to=ir.DataType.INT32)
 
     # Build StaticCacheState for each layer (shared indices)
     static_caches: list[StaticCacheState] = []

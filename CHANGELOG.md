@@ -36,8 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `com.microsoft::GroupQueryAttention` instead of `TensorScatter` +
   `Attention`. The op appends the new key/value itself, so the buffers become
   `[B, kv_heads, max_seq_len, head_dim]` and `write_indices` is gone;
-  `seqlens_k` / `total_seq_len` are derived in-graph from the unchanged
-  `nonpad_kv_seqlen`, so nothing else about the contract moves. It matters
+  `seqlens_k` is derived in-graph from the unchanged `nonpad_kv_seqlen` and
+  `total_sequence_length` is a constant (the buffer's capacity, which ORT
+  wants on the host — deriving it from a device tensor breaks graph capture,
+  and the op bounds its KV by `seqlens_k` anyway), so nothing else about the
+  contract moves. It matters
   where the static-cache attention path scales badly with context: on an A100
   it costs 0.41 us per token against GQA's 0.05, so at 4096 past tokens the
   48-layer step is 3.04 ms against 1.60. On Blackwell the two measure the same

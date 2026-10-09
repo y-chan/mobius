@@ -200,9 +200,18 @@ It changes the decoder's I/O, which is why it is opt-in. The buffers become
 against `[B, max_seq_len, kv_hidden]` for the TensorScatter path — and
 `write_indices` disappears, because GQA derives the write position from the KV
 length itself. `nonpad_kv_seqlen` stays, and the `seqlens_k` / `total_seq_len`
-pair GQA takes is computed inside the graph from it, so no other input
-changes. A driving loop therefore needs new cache buffers and one fewer feed;
-everything else about it is unchanged.
+pair GQA takes is produced inside the graph, so no other input changes. A
+driving loop therefore needs new cache buffers and one fewer feed; everything
+else about it is unchanged.
+
+One detail of that is load-bearing. `seqlens_k` is computed from
+`nonpad_kv_seqlen`, but `total_sequence_length` is emitted as a **constant**,
+the buffer's capacity. ORT wants that scalar on the host, so deriving it from
+a device tensor puts a device-to-host copy in the decode step and graph
+capture fails outright. A constant needs no copy. It is sound because the op
+bounds the KV it reads by `seqlens_k`: against the true length it measures the
+same (0.744 against 0.720 ms over 48 layers at 170 past tokens, identical at
+4096) and produces the same logits as the TensorScatter path.
 
 The feature is wired for speech-language exports (Qwen3-ASR,
 Qwen3-forced-aligner, Qwen3-Omni). The causal-LM and Gemma4 static-cache paths
