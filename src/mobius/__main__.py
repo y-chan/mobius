@@ -37,6 +37,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "text-only": "text_only",
     "glm-full-attention": "glm_full_attention",
     "paged-attention": "export_paged_attention",
+    "gqa-cache": "gqa_cache",
 }
 
 
@@ -172,12 +173,23 @@ def _cmd_build(args: argparse.Namespace) -> None:
         ):
             from mobius.tasks import SpeechLanguageTask
 
-            return SpeechLanguageTask(static_cache=True, max_seq_len=args.max_seq_len)
+            return SpeechLanguageTask(
+                static_cache=True,
+                max_seq_len=args.max_seq_len,
+                gqa_cache=args.gqa_cache,
+            )
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
 
     # Fold --features into the boolean build-mode attributes before any
     # validation reads them.
     _resolve_build_features(args)
+
+    # GQA owns the cache it is given, so there has to be one.
+    if args.gqa_cache and not args.static_cache:
+        raise SystemExit(
+            "Error: --features gqa-cache only applies to a static cache; "
+            "pass --features static-cache,gqa-cache."
+        )
 
     # Validate --max-seq-len requires the static-cache feature.
     if args.max_seq_len is not None and not args.static_cache:

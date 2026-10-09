@@ -42,6 +42,11 @@ fusions), and the EP decides two things that matter here:
   fallback materialises 18k expert tensors for this checkpoint and spends
   about twenty minutes in session initialisation.
 
+`--features gqa-cache`, alongside `static-cache`, hands the cache to
+`com.microsoft::GroupQueryAttention` instead of `TensorScatter` + `Attention`.
+It changes the decoder's I/O and is worth it only on some devices and prompt
+lengths; the last section has the numbers.
+
 `--features static-cache` is a prerequisite for graph capture, not an
 optimisation on its own: it replaces growing `past_key_values` and
 `attention_mask` with pre-allocated `key_cache.{i}` / `value_cache.{i}`
@@ -181,11 +186,26 @@ static path steeper still (0.58 µs per token) and GQA at 0.047. ORT 1.30
 improves the static path on SM80 without changing the asymptotics.
 
 So the attention op to emit is a function of the device and of how long the
-prompts are. Short prompts, or Blackwell, and the static path as exported is
-the right choice. Long prompts on SM80 and GQA is worth the rework, which is
-not small: `com.microsoft::GroupQueryAttention` wants its cache in
-`[B, kv_heads, max_seq, head_dim]`, where the static cache uses
-`[B, max_seq, kv_hidden]`, and converting the layout in the graph would copy
-the whole buffer every step. The buffers, their names and the
-`seqlens_k` / `total_seq_len` pair are part of the exported model's contract,
-so changing them is a change to every consumer of a static-cache export.
+prompts are, which is why it is a build feature rather than a default:
+
+```bash
+mobius build ... --features static-cache,gqa-cache
+```
+
+Short prompts, or Blackwell, and the static path as exported is already the
+right choice. Long prompts on SM80 and `gqa-cache` pays for itself.
+
+It changes the decoder's I/O, which is why it is opt-in. The buffers become
+4-D — `[B, kv_heads, max_seq_len, head_dim]`, the layout the op requires,
+against `[B, max_seq_len, kv_hidden]` for the TensorScatter path — and
+`write_indices` disappears, because GQA derives the write position from the KV
+length itself. `nonpad_kv_seqlen` stays, and the `seqlens_k` / `total_seq_len`
+pair GQA takes is computed inside the graph from it, so no other input
+changes. A driving loop therefore needs new cache buffers and one fewer feed;
+everything else about it is unchanged.
+
+The feature is wired for speech-language exports (Qwen3-ASR,
+Qwen3-forced-aligner, Qwen3-Omni). The causal-LM and Gemma4 static-cache paths
+still emit `TensorScatter` + `Attention`; extending them is mechanical, and
+Gemma4 additionally needs its bias layers to stay on the Attention op, which
+is the one thing GQA cannot express.

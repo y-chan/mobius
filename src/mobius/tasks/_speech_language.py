@@ -59,9 +59,16 @@ class SpeechLanguageTask(ModelTask):
         decoder="decoder",
     )
 
-    def __init__(self, *, static_cache: bool = False, max_seq_len: int | None = None):
+    def __init__(
+        self,
+        *,
+        static_cache: bool = False,
+        max_seq_len: int | None = None,
+        gqa_cache: bool = False,
+    ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._gqa_cache = gqa_cache
 
     def build(
         self,
@@ -85,6 +92,7 @@ class SpeechLanguageTask(ModelTask):
             mrope=True,
             static_cache=self._static_cache,
             max_seq_len=self._max_seq_len,
+            gqa_cache=self._gqa_cache,
         )
         return ModelPackage(models, config=config)
 

@@ -482,3 +482,82 @@ def test_transposed_attention_projections_match_plain(omni):
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_static_cache_gqa_matches_tensorscatter(omni):
+    """The GQA-owned cache computes what TensorScatter + Attention does."""
+    config, hf_model, _ = omni
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+
+    builds = {}
+    for name, gqa_cache in (("scatter", False), ("gqa", True)):
+        module = Qwen3OmniThinkerForConditionalGeneration(config)
+        package = build_from_module(
+            module,
+            config,
+            task=SpeechLanguageTask(
+                static_cache=True,
+                max_seq_len=_STATIC_MAX_SEQ_LEN,
+                gqa_cache=gqa_cache,
+            ),
+        )
+        package.apply_weights(module.preprocess_weights(state_dict))
+        builds[name] = package
+
+    scatter, gqa = builds["scatter"]["decoder"], builds["gqa"]["decoder"]
+    gqa_inputs = {i.name for i in gqa.graph.inputs}
+    # The op appends the new key/value itself, so the write position is gone
+    # and the buffers carry the head dimension it requires.
+    assert "write_indices" not in gqa_inputs
+    assert "write_indices" in {i.name for i in scatter.graph.inputs}
+    assert "nonpad_kv_seqlen" in gqa_inputs
+    assert not [n for n in gqa.graph.all_nodes() if n.op_type == "TensorScatter"]
+    gqa_nodes = [n for n in gqa.graph.all_nodes() if n.op_type == "GroupQueryAttention"]
+    assert len(gqa_nodes) == config.num_hidden_layers
+    key_cache = next(i for i in gqa.graph.inputs if i.name == "key_cache.0")
+    assert [d if isinstance(d, int) else None for d in key_cache.shape[1:]] == [
+        config.num_key_value_heads,
+        _STATIC_MAX_SEQ_LEN,
+        config.head_dim,
+    ]
+
+    rng = np.random.default_rng(11)
+    prompt = rng.standard_normal((1, 6, config.hidden_size)).astype(np.float32)
+    steps = [prompt] + [
+        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float32) for _ in range(3)
+    ]
+    layers = range(config.num_hidden_layers)
+    kv_heads, head_dim = config.num_key_value_heads, config.head_dim
+    scatter_cache = {
+        f"{kind}_cache.{i}": np.zeros(
+            (1, _STATIC_MAX_SEQ_LEN, kv_heads * head_dim), np.float32
+        )
+        for i in layers
+        for kind in ("key", "value")
+    }
+    gqa_cache = {
+        f"{kind}_cache.{i}": np.zeros((1, kv_heads, _STATIC_MAX_SEQ_LEN, head_dim), np.float32)
+        for i in layers
+        for kind in ("key", "value")
+    }
+    past_len = 0
+    for embeds in steps:
+        seq = embeds.shape[1]
+        pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+        position_ids = np.stack([pos, pos, pos])[:, None, :]
+        shared = {
+            "inputs_embeds": embeds,
+            "position_ids": position_ids,
+            "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+        }
+        scatter_out = _run(
+            scatter,
+            {**shared, "write_indices": np.array([past_len], np.int64), **scatter_cache},
+        )
+        gqa_out = _run(gqa, {**shared, **gqa_cache})
+        np.testing.assert_allclose(
+            gqa_out["logits"], scatter_out["logits"], rtol=1e-4, atol=1e-4
+        )
+        scatter_cache = {n: scatter_out[f"updated_{n}"] for n in scatter_cache}
+        gqa_cache = {n: gqa_out[f"updated_{n}"] for n in gqa_cache}
+        past_len += seq

@@ -226,6 +226,7 @@ def build_decoder_from_embeds(
     deepstack: bool = False,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    gqa_cache: bool = False,
 ) -> ir.Model:
     """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
 
@@ -248,11 +249,20 @@ def build_decoder_from_embeds(
             injects into its first ``D`` layers.
         static_cache: If ``True``, replace the growing ``past_key_values`` /
             ``present`` tensors and ``attention_mask`` with pre-allocated
-            ``key_cache.{i}`` / ``value_cache.{i}`` buffers updated through
-            ``TensorScatter``, plus ``write_indices`` and ``nonpad_kv_seqlen``
+            ``key_cache.{i}`` / ``value_cache.{i}`` buffers, plus
+            ``write_indices`` and ``nonpad_kv_seqlen``
             (same contract as :class:`CausalLMTask` static cache). Every
             decode step then has fixed input/output shapes, which is what
             CUDA graph capture requires.
+        gqa_cache: With ``static_cache``, let
+            ``com.microsoft::GroupQueryAttention`` own the cache instead of
+            ``TensorScatter`` + ``Attention``. The buffers become 4-D
+            ``[B, kv_heads, max_seq_len, head_dim]`` and ``write_indices``
+            disappears, so this changes the exported model's I/O. Worth it
+            where the static-cache attention path scales badly with context
+            (SM80: 0.41 us per token against GQA's 0.05); on Blackwell the two
+            measure the same. See
+            ``docs/design/qwen3-omni-cuda-graph-decoding.md``.
         max_seq_len: Static cache length. Defaults to
             ``config.max_position_embeddings``.
 
@@ -333,6 +343,7 @@ def build_decoder_from_embeds(
             config.dtype,
             batch,
             max_seq_len,
+            gqa=gqa_cache,
         )
     elif hybrid:
         past_key_values = _make_hybrid_cache_inputs(

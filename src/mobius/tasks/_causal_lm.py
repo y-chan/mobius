@@ -481,12 +481,18 @@ def _make_static_cache_inputs(
     batch: ir.SymbolicDim,
     max_seq_len: int,
     cache_specs: list[tuple[int, int]] | None = None,
+    gqa: bool = False,
 ) -> list[StaticCacheState]:
     """Create static KV cache inputs for the cache-owning layers.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
 
     Args:
+        gqa: Shape the buffers for ``com.microsoft::GroupQueryAttention``
+            (4-D ``[B, kv_heads, max_seq_len, head_dim]``) and derive its
+            ``seqlens_k`` / ``total_seq_len`` pair instead of creating
+            ``write_indices``. The op appends the new key/value itself, so the
+            graph carries no ``TensorScatter``.
         cache_specs: Optional per-cache-layer ``(num_key_value_heads, head_dim)``
             list. When provided (e.g. from a model's ``static_kv_cache_specs()``),
             one buffer is allocated per entry with its own ``kv_hidden`` — this
@@ -505,30 +511,43 @@ def _make_static_cache_inputs(
 
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
     for i, (kv_heads, layer_head_dim) in enumerate(cache_specs):
-        kv_hidden = kv_heads * layer_head_dim
-        key_cache = builder.input(
-            f"key_cache.{i}",
-            dtype=dtype,
-            shape=[batch, max_seq_len, kv_hidden],
+        shape = (
+            [batch, kv_heads, max_seq_len, layer_head_dim]
+            if gqa
+            else [batch, max_seq_len, kv_heads * layer_head_dim]
         )
-        value_cache = builder.input(
-            f"value_cache.{i}",
-            dtype=dtype,
-            shape=[batch, max_seq_len, kv_hidden],
-        )
+        key_cache = builder.input(f"key_cache.{i}", dtype=dtype, shape=shape)
+        value_cache = builder.input(f"value_cache.{i}", dtype=dtype, shape=shape)
         cache_pairs.append((key_cache, value_cache))
 
     # Shared inputs across all layers
-    write_indices = builder.input(
-        STATIC_CACHE_WRITE_INDICES,
-        dtype=ir.DataType.INT64,
-        shape=[batch],
+    write_indices = (
+        None
+        if gqa
+        else builder.input(
+            STATIC_CACHE_WRITE_INDICES,
+            dtype=ir.DataType.INT64,
+            shape=[batch],
+        )
     )
     nonpad_kv_seqlen = builder.input(
         STATIC_CACHE_KV_SEQUENCE_LENGTH,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )
+
+    seqlens_k = total_seq_len = None
+    if gqa:
+        # GQA wants the last valid index per batch entry and the scalar total,
+        # both int32; nonpad_kv_seqlen already carries the length, so the pair
+        # is derived once here rather than added to the model's input contract.
+        op = builder.op
+        seqlens_k = op.Cast(
+            op.Sub(nonpad_kv_seqlen, op.Constant(value_int=1)), to=ir.DataType.INT32
+        )
+        total_seq_len = op.Cast(
+            op.Gather(nonpad_kv_seqlen, op.Constant(value_int=0)), to=ir.DataType.INT32
+        )
 
     # Build StaticCacheState for each layer (shared indices)
     static_caches: list[StaticCacheState] = []
@@ -539,6 +558,8 @@ def _make_static_cache_inputs(
                 value_cache=value_cache,
                 write_indices=write_indices,
                 nonpad_kv_seqlen=nonpad_kv_seqlen,
+                seqlens_k=seqlens_k,
+                total_seq_len=total_seq_len,
             )
         )
 
