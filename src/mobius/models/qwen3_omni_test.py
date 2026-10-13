@@ -791,6 +791,9 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
     }
     # Two norms and two rotaries per layer move inside the op.
     assert counts["fused"]["RotaryEmbedding"] == 0
+    # The op is handed the positions rather than inferring them from the KV
+    # length, so the input stays part of the decoder's contract.
+    assert "position_ids" in {i.name for i in fused.graph.inputs}
     assert counts["separate"]["RotaryEmbedding"] == 2 * config.num_hidden_layers
     assert (
         counts["separate"]["RMSNormalization"] - counts["fused"]["RMSNormalization"]

@@ -44,6 +44,11 @@ class GQAContext(NamedTuple):
         local_window_size: Left window size for local/sliding-window attention.
             ``-1`` means unused (full causal attention).  Maps to the
             ``local_window_size`` attribute on ``GroupQueryAttention``.
+        position_ids: Rotary positions ``[batch, seq_len]`` INT64. Only the
+            static-cache folded path sets this. Without it the op takes the
+            position from the KV length, which is the same thing only while
+            the cache is filled front to back with no gaps -- true today, and
+            false for anything that reuses or rewrites a prefix.
     """
 
     seqlens_k: ir.Value
@@ -51,6 +56,7 @@ class GQAContext(NamedTuple):
     cos_cache: ir.Value
     sin_cache: ir.Value
     local_window_size: int = -1
+    position_ids: ir.Value | None = None
 
 
 class StaticCacheState(NamedTuple):
@@ -537,7 +543,7 @@ class Attention(nn.Module):
             static_cache.total_seq_len,
             gqa_ctx.cos_cache,
             gqa_ctx.sin_cache,
-            None,  # position_ids: derived from seqlens_k
+            gqa_ctx.position_ids,
             None,  # attention_bias
             None,  # head_sink
             None,  # k_scale

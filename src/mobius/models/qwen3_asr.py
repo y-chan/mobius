@@ -525,11 +525,22 @@ class Qwen3ASRDecoderModel(nn.Module):
             # realizes cos_cache / sin_cache as initializers.
             from mobius.components._attention import GQAContext
 
+            # The op can infer the rotary position from the KV length, but
+            # only while the cache fills front to back; hand it the positions
+            # the model was given instead. mRoPE's three axes agree wherever
+            # the fused 1-D rotary is valid at all, so the temporal one speaks
+            # for all three.
+            rotary_positions = (
+                op.Gather(position_ids, op.Constant(value_int=0), axis=0)
+                if len(position_ids.shape or ()) == 3
+                else position_ids
+            )
             attention_bias = GQAContext(
                 seqlens_k=None,  # the static cache carries these
                 total_seq_len=None,
                 cos_cache=self.rotary_emb.cos_cache,
                 sin_cache=self.rotary_emb.sin_cache,
+                position_ids=rotary_positions,
             )
             position_embeddings = None
 
