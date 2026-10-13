@@ -710,3 +710,48 @@ def test_lm_head_quantization_rejects_tied_embeddings(omni):
     tied = dataclasses.replace(config, tie_word_embeddings=True, export_lm_head_weight_bits=8)
     with pytest.raises(ValueError, match="tied word"):
         Qwen3OmniThinkerForConditionalGeneration(tied)
+
+
+def test_gqa_cache_and_quantized_weights_combine(omni):
+    """The serving configuration: GQA's cache, 8-bit projections and head.
+
+    These are orthogonal -- one picks the attention op and its buffers, the
+    others replace weights -- but it is the combination that ships, so the
+    node census and the decoder's inputs are pinned here.
+    """
+    config, hf_model, _ = omni
+    quantized = dataclasses.replace(
+        config,
+        export_attn_weight_bits=8,
+        export_lm_head_weight_bits=8,
+        export_weight_quant_block_size=_ATTN_BLOCK,
+    )
+    module = Qwen3OmniThinkerForConditionalGeneration(quantized)
+    package = build_from_module(
+        module,
+        quantized,
+        task=SpeechLanguageTask(
+            static_cache=True, max_seq_len=_STATIC_MAX_SEQ_LEN, gqa_cache=True
+        ),
+    )
+    package.apply_weights(
+        module.preprocess_weights(
+            {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+        )
+    )
+
+    decoder = package["decoder"]
+    counts = collections.Counter(n.op_type for n in decoder.graph.all_nodes())
+    # Two projections per layer plus the head; the router gates stay MatMul.
+    assert counts["MatMulNBits"] == 2 * config.num_hidden_layers + 1
+    assert counts["MatMul"] == config.num_hidden_layers
+    assert counts["GroupQueryAttention"] == config.num_hidden_layers
+    assert counts["TensorScatter"] == 0
+    assert counts["FusedMatMul"] == 0
+    # Quantizing weights leaves the model's I/O alone, so a loop written for
+    # the GQA cache needs no change for it.
+    assert {i.name for i in decoder.graph.inputs if "cache" not in i.name} == {
+        "inputs_embeds",
+        "position_ids",
+        "nonpad_kv_seqlen",
+    }
