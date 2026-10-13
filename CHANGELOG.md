@@ -58,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured on this model it holds up on both architectures, and the greedy
   tokens still match the HF reference. Requires `--dtype f16`, since the op's
   CUDA kernel reads fp16 scales; bf16 is refused. Wired for Qwen3-Omni.
+- `--features gqa-fused-rope`, alongside `gqa-cache`, hands the per-head Q/K
+  norm weights and the rotary tables to `com.microsoft::GroupQueryAttention`
+  (`q_norm_weight` / `k_norm_weight` with `qk_norm_epsilon`, and
+  `do_rotary=1`) instead of emitting them as separate ops: 192 fewer nodes
+  over 48 layers. Those ops read 8 KB at one token, so they cost what a launch
+  costs rather than what the data costs, and folding them measured 6.51 ->
+  6.16 ms per decode step on an RTX PRO 6000 (154 -> 163 tokens/s) with the
+  tokens unchanged against the HuggingFace reference. On an A100 the same
+  kernels take 0.73 ms, against 0.047 ms to do both inside the GQA kernel.
+  Two things make it opt-in: the fused rotary is 1-D, which mRoPE reduces to
+  only while every position carries the same T/H/W (audio and text, not
+  images), and ORT implements the norm prologue on CUDA and WebGPU but not on
+  the CPU EP. **The decoder loses its `position_ids` input** -- the op derives
+  the rotary position from the KV length -- so a driving loop feeds one fewer
+  tensor.
 - `--features static-cache,gqa-cache` hands the static KV cache to
   `com.microsoft::GroupQueryAttention` instead of `TensorScatter` +
   `Attention`. The op appends the new key/value itself, so the buffers become

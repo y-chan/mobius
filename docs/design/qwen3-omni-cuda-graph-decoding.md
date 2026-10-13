@@ -78,6 +78,13 @@ greedy tokens still match the HF reference on all ten runs of the test clip.
 It changes the decoder's I/O and is worth it only on some devices and prompt
 lengths; the last section has the numbers.
 
+`--features gqa-fused-rope`, with `gqa-cache`, additionally gives that node
+the Q/K norm weights and the rotary tables so neither is emitted per layer.
+It takes the decoder's `position_ids` input away, because the op derives the
+rotary position from the KV length instead, and it is only correct while
+position_ids carry the same value on all three mRoPE axes. Measured 6.51 ->
+6.16 ms per decode step on an RTX PRO 6000, tokens unchanged.
+
 `--features static-cache` is a prerequisite for graph capture, not an
 optimisation on its own: it replaces growing `past_key_values` and
 `attention_mask` with pre-allocated `key_cache.{i}` / `value_cache.{i}`
