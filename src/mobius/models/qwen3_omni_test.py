@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 
 import numpy as np
@@ -17,6 +18,7 @@ from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._execution_providers import EpCapabilities
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius._weight_utils import quantize_linear_int8_blocks
 from mobius.integrations.transformers._builder import _select_primary_config
 from mobius.models.qwen3_omni import Qwen3OmniThinkerForConditionalGeneration
 from mobius.tasks import SpeechLanguageTask
@@ -561,3 +563,79 @@ def test_static_cache_gqa_matches_tensorscatter(omni):
         scatter_cache = {n: scatter_out[f"updated_{n}"] for n in scatter_cache}
         gqa_cache = {n: gqa_out[f"updated_{n}"] for n in gqa_cache}
         past_len += seq
+
+
+_ATTN_BLOCK = 32
+
+
+def _dequantize_attention(weights: dict, block_size: int) -> dict:
+    """Round-trip the projections the way MatMulNBits will read them back."""
+    for key, value in list(weights.items()):
+        if not key.startswith("decoder.layers.") or not key.endswith(
+            (".qkv_proj.weight", ".o_proj.weight")
+        ):
+            continue
+        payload, scales = quantize_linear_int8_blocks(value, block_size=block_size)
+        out_features, n_blocks, _ = payload.shape
+        dequantized = (payload.float() - 128) * scales.float().reshape(
+            out_features, n_blocks, 1
+        )
+        weights[key] = dequantized.reshape(out_features, -1).to(value.dtype)
+    return weights
+
+
+def test_attention_projections_quantize_to_matmulnbits(omni):
+    """8-bit projections match the same weights dequantized into the float graph."""
+    config, hf_model, _ = omni
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+    quantized_config = dataclasses.replace(
+        config, export_attn_weight_bits=8, export_attn_weight_block_size=_ATTN_BLOCK
+    )
+
+    packages = {}
+    for name, cfg in (("float", config), ("nbits", quantized_config)):
+        module = Qwen3OmniThinkerForConditionalGeneration(cfg)
+        package = build_from_module(module, cfg, task=SpeechLanguageTask())
+        weights = module.preprocess_weights(state_dict)
+        if name == "float":
+            weights = _dequantize_attention(weights, _ATTN_BLOCK)
+        package.apply_weights(weights)
+        packages[name] = package
+
+    decoder = packages["nbits"]["decoder"]
+    counts = collections.Counter(n.op_type for n in decoder.graph.all_nodes())
+    # qkv_proj and o_proj per layer; the router gate and LM head stay float.
+    assert counts["MatMulNBits"] == 2 * config.num_hidden_layers
+    assert counts["FusedMatMul"] == 0
+    payload = next(
+        i for i in decoder.graph.initializers.values() if i.name.endswith("qkv_proj.weight")
+    )
+    kv_width = config.num_key_value_heads * config.head_dim
+    assert payload.dtype == ir.DataType.UINT8
+    assert payload.shape.dims == (
+        config.num_attention_heads * config.head_dim + 2 * kv_width,
+        config.hidden_size // _ATTN_BLOCK,
+        _ATTN_BLOCK,
+    )
+
+    rng = np.random.default_rng(13)
+    embeds = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float32)
+    pos = np.arange(embeds.shape[1], dtype=np.int64)
+    feeds = {
+        "inputs_embeds": embeds,
+        "attention_mask": np.ones((1, embeds.shape[1]), np.int64),
+        "position_ids": np.stack([pos, pos, pos])[:, None, :],
+        **{
+            f"past_key_values.{i}.{kind}": np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim), np.float32
+            )
+            for i in range(config.num_hidden_layers)
+            for kind in ("key", "value")
+        },
+    }
+    np.testing.assert_allclose(
+        _run(decoder, feeds)["logits"],
+        _run(packages["float"]["decoder"], feeds)["logits"],
+        rtol=1e-3,
+        atol=1e-3,
+    )

@@ -815,6 +815,51 @@ def stack_per_expert_moe_weights(
     return result
 
 
+def quantize_linear_int8_blocks(
+    weight: torch.Tensor,
+    *,
+    block_size: int = 128,
+    scale_dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a float ``[N, K]`` projection for 8-bit ``MatMulNBits``.
+
+    Symmetric, one scale per ``block_size`` input features, no zero-points --
+    ``MatMulNBits`` then uses its implicit ``2 ** (bits - 1)`` of 128. At 8 bits
+    nothing is bit-packed, so the payload keeps the op's ``[N, n_blocks,
+    blob_size]`` shape with ``blob_size == block_size``.
+
+    The scale is rounded to ``scale_dtype`` *before* the weights are divided by
+    it, so the stored integers are the best fit for the scale the runtime will
+    actually read rather than for a float32 one it never sees. Quantize from the
+    checkpoint's own dtype rather than from an already-narrowed copy: for the
+    Qwen3-Omni thinker's projections, going from bf16 instead of fp16 is the
+    difference between 0.69% and 0.9% mean relative error.
+
+    Args:
+        weight: Float weight, ``[out_features, in_features]``.
+        block_size: Input features per scale. Must divide ``in_features``.
+        scale_dtype: Dtype the scales are stored in, i.e. the model's dtype.
+
+    Returns:
+        ``(payload, scales)`` -- ``uint8 [N, n_blocks, block_size]`` and
+        ``scale_dtype [N, n_blocks]``.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"expected a 2-D weight, got shape {tuple(weight.shape)}")
+    out_features, in_features = weight.shape
+    if in_features % block_size:
+        raise ValueError(
+            f"in_features={in_features} is not divisible by block_size={block_size}"
+        )
+    blocks = weight.float().reshape(out_features, in_features // block_size, block_size)
+    scales = blocks.abs().amax(-1, keepdim=True) / 127.0
+    # An all-zero block would divide by zero; any non-zero scale reproduces it.
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    stored = scales.to(scale_dtype)
+    payload = torch.round(blocks / stored.float()).add_(128).clamp_(0, 255).to(torch.uint8)
+    return payload, stored.reshape(out_features, -1)
+
+
 def pack_qmoe_expert_weights(
     state_dict: dict[str, torch.Tensor],
     *,

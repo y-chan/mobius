@@ -38,6 +38,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "glm-full-attention": "glm_full_attention",
     "paged-attention": "export_paged_attention",
     "gqa-cache": "gqa_cache",
+    "attn-int8": "attn_int8",
 }
 
 
@@ -183,6 +184,20 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # Fold --features into the boolean build-mode attributes before any
     # validation reads them.
     _resolve_build_features(args)
+
+    # MatMulNBits' CUDA kernel reads fp16 scales, so the build dtype decides
+    # whether the quantized projections can run at all.
+    if args.attn_int8:
+        if args.dtype not in ("f16", "float16"):
+            raise SystemExit(
+                "Error: --features attn-int8 requires --dtype f16 (got "
+                f"'{args.dtype}'); ORT's MatMulNBits CUDA kernel reads fp16 scales."
+            )
+        block = args.attn_block_size
+        if block < 16 or block & (block - 1):
+            raise SystemExit(
+                f"Error: --attn-block-size must be a power of two >= 16, got {block}."
+            )
 
     # GQA owns the cache it is given, so there has to be one.
     if args.gqa_cache and not args.static_cache:
@@ -391,6 +406,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 prune_prefill_prefix=prune_prefill_prefix,
                 glm_full_attention=args.glm_full_attention,
                 export_paged_attention=export_paged_attention,
+                attn_weight_bits=8 if args.attn_int8 else None,
+                attn_weight_block_size=args.attn_block_size,
                 keep_quantized=keep_quantized,
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
@@ -457,6 +474,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            attn_weight_bits=8 if args.attn_int8 else None,
+            attn_weight_block_size=args.attn_block_size,
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
@@ -492,6 +511,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            attn_weight_bits=8 if args.attn_int8 else None,
+            attn_weight_block_size=args.attn_block_size,
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
@@ -1358,6 +1379,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum sequence length for static cache buffers. "
         "Only used with --features static-cache. "
         "Defaults to max_position_embeddings from config.",
+    )
+    build_parser.add_argument(
+        "--attn-block-size",
+        type=int,
+        default=128,
+        metavar="N",
+        help="Input features per weight-quantization scale for the attention "
+        "projections. Only used with --features attn-int8. Must be a power of "
+        "two >= 16 and divide every projection's input dimension. Default 128.",
     )
     build_parser.add_argument(
         "--runtime",

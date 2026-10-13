@@ -35,7 +35,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import preprocess_quantized_weights
+from mobius._weight_utils import preprocess_quantized_weights, quantize_linear_int8_blocks
 from mobius.components import (
     FusedQKVAttention,
     Linear,
@@ -43,6 +43,7 @@ from mobius.components import (
     SoftmaxTopKGate,
     TransposedLinear,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._moe import _realize_gate_and_get_qmoe_routing
 from mobius.models.moe import MoEDecoderLayer, _rename_moe_expert_weights
@@ -124,6 +125,60 @@ def _use_fused_qkv(config: ArchitectureConfig) -> bool:
     return _use_fused_moe(config) or (
         _is_quantized(config) and _float_attention_in_quantized_checkpoint(config)
     )
+
+
+_ATTENTION_PROJECTIONS = (".self_attn.qkv_proj", ".self_attn.o_proj")
+
+
+def _attention_linear_class(config: ArchitectureConfig) -> type:
+    """Projection class for the thinker's attention.
+
+    ``export_attn_weight_bits`` turns the two projections into
+    ``com.microsoft::MatMulNBits``, quantized from the checkpoint at export
+    time. Otherwise they stay float, and
+    :class:`~mobius.components.TransposedLinear` hands cuBLAS the layout it is
+    fast at -- a choice the quantized path does not need, since
+    ``MatMulNBits`` already takes the weight as ``[out, in]``.
+    """
+    bits = config.export_attn_weight_bits
+    if bits is None:
+        return TransposedLinear
+    return make_quantized_linear_factory(
+        bits=bits,
+        block_size=config.export_attn_weight_block_size,
+        has_zero_point=False,
+    )
+
+
+def _quantize_attention_projections(
+    state_dict: dict[str, torch.Tensor], *, bits: int, block_size: int
+) -> dict[str, torch.Tensor]:
+    """Replace the decoder's float projections with ``MatMulNBits`` payloads.
+
+    Runs on the mapped names, after the Q/K/V tensors have been joined, so
+    there are two weights per layer to convert.
+    """
+    if bits != 8:
+        raise ValueError(f"export_attn_weight_bits must be 8 or None, got {bits}")
+    converted: dict[str, torch.Tensor] = {}
+    for key in list(state_dict):
+        if not key.startswith("decoder.layers."):
+            continue
+        prefix = key.removesuffix(".weight")
+        if prefix == key or not prefix.endswith(_ATTENTION_PROJECTIONS):
+            continue
+        payload, scales = quantize_linear_int8_blocks(
+            state_dict.pop(key), block_size=block_size
+        )
+        converted[key] = payload
+        converted[f"{prefix}.scales"] = scales
+    if not converted:
+        raise ValueError(
+            "export_attn_weight_bits is set but the checkpoint has no float "
+            "decoder.layers.*.self_attn.{qkv_proj,o_proj}.weight to quantize"
+        )
+    state_dict.update(converted)
+    return state_dict
 
 
 def _pack_qkv_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -287,7 +342,9 @@ class Qwen3OmniDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
-        self.self_attn = FusedQKVAttention(config, linear_class=TransposedLinear)
+        self.self_attn = FusedQKVAttention(
+            config, linear_class=_attention_linear_class(config)
+        )
         self.mlp = Qwen3OmniFusedMoE(config, gate=gate)
 
 
@@ -301,7 +358,9 @@ class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
         super().__init__(config, gate=gate, **kwargs)
-        self.self_attn = FusedQKVAttention(config, linear_class=TransposedLinear)
+        self.self_attn = FusedQKVAttention(
+            config, linear_class=_attention_linear_class(config)
+        )
 
 
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
@@ -409,7 +468,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
         - ``thinker.model.{layers,norm}.*`` → ``decoder.{layers,norm}.*``
           (expert weights are stacked for the fused MoE node, or split per
           expert for the loop fallback; Q/K/V are joined into ``qkv_proj``
-          whenever the layers keep attention in float)
+          whenever the layers keep attention in float, and the projections are
+          quantized here when ``export_attn_weight_bits`` asks for it)
         - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
         """
         thinker_state: dict[str, torch.Tensor] = {}
@@ -450,7 +510,7 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
         embed_key = "embedding.embed_tokens.weight"
         lm_key = "decoder.lm_head.weight"
         if quantized:
-            return preprocess_quantized_weights(
+            result = preprocess_quantized_weights(
                 cleaned,
                 self.config.quantization,
                 tie_embeddings=self.config.tie_word_embeddings,
@@ -460,10 +520,21 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
                 qmoe_quant_methods=("olive",),
                 reject_quantized_embeddings_lm_head=True,
             )
-        if self.config.tie_word_embeddings:
-            if embed_key in cleaned and lm_key not in cleaned:
-                cleaned[lm_key] = cleaned[embed_key]
-            elif lm_key in cleaned and embed_key not in cleaned:
-                cleaned[embed_key] = cleaned[lm_key]
+        else:
+            if self.config.tie_word_embeddings:
+                if embed_key in cleaned and lm_key not in cleaned:
+                    cleaned[lm_key] = cleaned[embed_key]
+                elif lm_key in cleaned and embed_key not in cleaned:
+                    cleaned[embed_key] = cleaned[lm_key]
+            result = cleaned
 
-        return cleaned
+        # Last, so the checkpoint's own quantized tensors are already in their
+        # final names and nothing here is mistaken for one of them.
+        if self.config.export_attn_weight_bits is not None:
+            result = _quantize_attention_projections(
+                result,
+                bits=self.config.export_attn_weight_bits,
+                block_size=self.config.export_attn_weight_block_size,
+            )
+
+        return result

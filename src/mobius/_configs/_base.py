@@ -737,6 +737,15 @@ class ArchitectureConfig(BaseModelConfig):
     # semantic geometry (see ``mobius.components._paged_mla``), never model names;
     # an incompatible geometry raises rather than silently falling back.
     export_paged_attention: bool = False
+    # Opt-in weight-only quantization of the attention projections at export
+    # time, for checkpoints that store them in float. ``None`` keeps them float
+    # (the default, and exports are unchanged). ``8`` emits
+    # ``com.microsoft::MatMulNBits`` with symmetric block quantization and no
+    # zero-points, which on an A100 is ~5.6% faster per decode step and ~0.9 GB
+    # smaller for the Qwen3-Omni thinker, at a ~4% slower prefill. Only the
+    # projections are affected; routed experts and the LM head are not.
+    export_attn_weight_bits: int | None = None
+    export_attn_weight_block_size: int = 128
     # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
     # top-k selection from the closest preceding "full" layer). When the
     # checkpoint config omits this list, it is derived from

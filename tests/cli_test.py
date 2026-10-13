@@ -860,6 +860,77 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_attn_int8_passes_bits_and_block_size(self):
+        """--features attn-int8 reaches build() as a bit-width and a block size."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--dtype",
+                    "f16",
+                    "--features",
+                    "attn-int8",
+                    "--attn-block-size",
+                    "64",
+                ]
+            )
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs.get("attn_weight_bits") == 8
+        assert kwargs.get("attn_weight_block_size") == 64
+
+    def test_attn_int8_requires_fp16(self):
+        """MatMulNBits' CUDA kernel reads fp16 scales, so bf16 is refused."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"attn-int8 requires --dtype f16"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--dtype",
+                    "bf16",
+                    "--features",
+                    "attn-int8",
+                ]
+            )
+
+    def test_attn_block_size_must_be_a_power_of_two(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"--attn-block-size must be a power of two"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--dtype",
+                    "f16",
+                    "--features",
+                    "attn-int8",
+                    "--attn-block-size",
+                    "100",
+                ]
+            )
+
     def test_max_seq_len_without_static_cache_errors(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,

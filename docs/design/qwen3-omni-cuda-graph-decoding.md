@@ -42,6 +42,15 @@ fusions), and the EP decides two things that matter here:
   fallback materialises 18k expert tensors for this checkpoint and spends
   about twenty minutes in session initialisation.
 
+`--features attn-int8` quantizes the two attention projections at export
+time and emits `com.microsoft::MatMulNBits` (8-bit, symmetric, one scale per
+`--attn-block-size` input features, no zero-points) in place of the float
+`FusedMatMul`. On an A100 with the GQA cache and graph capture that is 6.81 →
+6.43 ms per decode step (147 → 155 tokens/s) and 0.9 GB less weight, against a
+~4% slower prefill. Routed experts and the LM head are untouched. It requires
+`--dtype f16`, since ORT's MatMulNBits CUDA kernel reads fp16 scales, and the
+build refuses bf16 rather than emitting a graph that cannot run.
+
 `--features gqa-cache`, alongside `static-cache`, hands the cache to
 `com.microsoft::GroupQueryAttention` instead of `TensorScatter` + `Attention`.
 It changes the decoder's I/O and is worth it only on some devices and prompt
@@ -218,3 +227,30 @@ Qwen3-forced-aligner, Qwen3-Omni). The causal-LM and Gemma4 static-cache paths
 still emit `TensorScatter` + `Attention`; extending them is mechanical, and
 Gemma4 additionally needs its bias layers to stay on the Attention op, which
 is the one thing GQA cannot express.
+
+## Quantizing the attention projections
+
+`--features attn-int8` is the one place where mobius adds quantization rather
+than carrying the checkpoint's own. The weights are quantized in
+`preprocess_weights`, from whatever dtype the checkpoint stores — bf16 for
+this model — which is why it is a build feature and not a post-export rewrite:
+quantizing an already-narrowed fp16 copy costs accuracy (0.9% mean relative
+error against 0.69% from bf16, at block 128).
+
+The emission is `QuantizedLinear`, the component the GPTQ and AWQ paths
+already use, injected through `linear_class`. At 8 bits nothing is bit-packed,
+so its `[N, n_blocks, blob_size]` payload is exactly `[out, in/block, block]`,
+and `accuracy_level` is omitted for anything other than 4 bits. Zero-points
+are left off so the op uses its implicit 128.
+
+The scale is rounded to the model dtype *before* the weights are divided by
+it, so the stored integers fit the scale the kernel will actually read. Mean
+relative weight error is 0.69%, worst 0.91%, at block 128.
+
+What this does to the output has only been checked on one clip of 300 steps:
+against the float export, the argmax agrees at 99.0% of positions and the
+median KL is 4.9e-07, while agreement with vLLM's tokens is 98.3% against the
+float export's 98.0%. One position differed on a digit (`1` → `2`) where the
+float export was right. The worst-case KL of 0.16 is larger than a fake-quant
+study of the same scheme suggested (0.024), so **several clips are still
+needed** before treating this as settled.

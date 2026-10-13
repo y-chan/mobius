@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
   instead of growing `past_key_values` and `attention_mask`, so single-token
   decode steps have fixed shapes and can be replayed from a CUDA graph.
+- `--features attn-int8` quantizes a decoder's attention projections at export
+  time and emits them as `com.microsoft::MatMulNBits` (8-bit, symmetric, one
+  scale per `--attn-block-size` input features, no zero-points) instead of a
+  float `MatMul`. Unlike the GPTQ / AWQ / Olive paths this adds quantization
+  rather than carrying the checkpoint's own, so it quantizes from the
+  checkpoint's dtype: for the Qwen3-Omni thinker, from bf16 rather than from
+  the fp16 export, which is 0.69% mean relative weight error instead of 0.9%.
+  On an A100 with the GQA cache and graph capture, a decode step goes 6.81 →
+  6.43 ms (147 → 155 tokens/s) and the decoder's weights shrink by 0.9 GB, at
+  a ~4% slower prefill. Requires `--dtype f16`, since the op's CUDA kernel
+  reads fp16 scales; bf16 is refused. Wired for Qwen3-Omni.
 - `--features static-cache,gqa-cache` hands the static KV cache to
   `com.microsoft::GroupQueryAttention` instead of `TensorScatter` +
   `Attention`. The op appends the new key/value itself, so the buffers become
