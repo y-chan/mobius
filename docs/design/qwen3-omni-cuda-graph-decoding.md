@@ -45,11 +45,19 @@ fusions), and the EP decides two things that matter here:
 `--features attn-int8` quantizes the two attention projections at export
 time and emits `com.microsoft::MatMulNBits` (8-bit, symmetric, one scale per
 `--attn-block-size` input features, no zero-points) in place of the float
-`FusedMatMul`. On an A100 with the GQA cache and graph capture that is 6.81 →
-6.43 ms per decode step (147 → 155 tokens/s) and 0.9 GB less weight, against a
-~4% slower prefill. Routed experts and the LM head are untouched. It requires
-`--dtype f16`, since ORT's MatMulNBits CUDA kernel reads fp16 scales, and the
-build refuses bf16 rather than emitting a graph that cannot run.
+matmul. Routed experts and the LM head are untouched. It requires `--dtype
+f16`, since ORT's MatMulNBits CUDA kernel reads fp16 scales, and the build
+refuses bf16 rather than emitting a graph that cannot run.
+
+| | A100, GQA cache | Blackwell, static cache |
+|---|---|---|
+| decode step | 6.81 → 6.43 ms | 6.51 → 6.01 ms |
+| tokens/s | 147 → 155 | 154 → 167 |
+| prefill | +4% | +1% |
+
+This is the one optimisation here that has held up on both architectures.
+Blackwell gets more of it: the decoder's `Run` goes 5.43 → 4.86 ms, and the
+greedy tokens still match the HF reference on all ten runs of the test clip.
 
 `--features gqa-cache`, alongside `static-cache`, hands the cache to
 `com.microsoft::GroupQueryAttention` instead of `TensorScatter` + `Attention`.
