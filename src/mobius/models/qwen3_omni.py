@@ -168,10 +168,11 @@ def _quantize_named_weight(
 def _lm_head_class(config: ArchitectureConfig) -> type:
     """Projection class for the LM head.
 
-    ``export_lm_head_weight_bits`` makes it a ``MatMulNBits`` too. It is a
-    smaller prize than the attention projections and a worse risk: one GEMV
-    per step against 48, already running near the memory roofline, and its
-    error reaches the logits without passing through another layer.
+    ``export_lm_head_weight_bits`` makes it a ``MatMulNBits`` too. It is one
+    GEMV per step against the projections' 48, so a smaller prize -- 0.39 ms
+    of a 4.86 ms decode step on Blackwell, and it already ran at 1.6 TB/s --
+    but a cheaper one than the projections: the head applies once, where a
+    projection's quantization error compounds through 48 layers.
     """
     bits = config.export_lm_head_weight_bits
     if bits is None:

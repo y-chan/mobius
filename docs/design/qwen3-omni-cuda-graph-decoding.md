@@ -42,11 +42,15 @@ fusions), and the EP decides two things that matter here:
   fallback materialises 18k expert tensors for this checkpoint and spends
   about twenty minutes in session initialisation.
 
-`--features lm-head-int8` does the same for the LM head. It is a smaller
-prize and a worse risk: one GEMV per step against the projections' 48, already
-running at 1.6 TB/s, and its error reaches the logits without passing through
-another layer. It refuses a checkpoint with tied word embeddings, where
-quantizing the head would untie it and store the vocabulary twice.
+`--features lm-head-int8` does the same for the LM head: 6.01 → 5.79 ms per
+decode step (167 → 173 tokens/s), the head itself 0.387 → 0.186 ms. One GEMV
+per step against the projections' 48, so a smaller prize -- but a cheaper one
+than its position suggests. Over 35 teacher-forced positions, quantizing the
+head moves the logits a seventh as far as quantizing the projections does
+(mean |Δ| 0.019 against 0.134, worst 0.15 against 3.1), because the head
+applies once where a projection's error compounds through 48 layers. It
+refuses a checkpoint with tied word embeddings, where quantizing the head
+would untie it and store the vocabulary twice.
 
 `--features attn-int8` quantizes the two attention projections at export
 time and emits `com.microsoft::MatMulNBits` (8-bit, symmetric, one scale per
@@ -283,7 +287,13 @@ extra scale traffic predicts, nothing more — and the default is 128 only
 because that is the size the end-to-end quality study below used. A study at
 64 would be the thing that justifies moving it.
 
-What this does to the output has only been checked on one clip of 300 steps:
+Both features together take the step to 5.79 ms, 4.97 ms of it the model
+rather than the test harness, against vLLM's int8 path at 5.71 ms on the same
+GPU. Neither changes the greedy tokens on the test clip: all ten runs still
+match the HF reference, and the argmax agrees at all 35 forced positions.
+
+What this does to the output beyond that has only been checked on one clip of
+300 steps:
 against the float export, the argmax agrees at 99.0% of positions and the
 median KL is 4.9e-07, while agreement with vLLM's tokens is 98.3% against the
 float export's 98.0%. One position differed on a digit (`1` → `2`) where the

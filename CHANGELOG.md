@@ -32,10 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
   instead of growing `past_key_values` and `attention_mask`, so single-token
   decode steps have fixed shapes and can be replayed from a CUDA graph.
-- `--features lm-head-int8` quantizes the LM head the same way. Separate from
-  `attn-int8` because the trade differs: one GEMV per step against 48, already
-  near the memory roofline, and the error reaches the logits directly rather
-  than through another layer. Refused for tied word embeddings, which
+- `--features lm-head-int8` quantizes the LM head the same way: 6.01 → 5.79 ms
+  per decode step (167 → 173 tokens/s) on an RTX PRO 6000, the head itself
+  0.387 → 0.186 ms. A smaller prize than the projections at one GEMV per step
+  against 48, but a cheaper one: over 35 teacher-forced positions it moves the
+  logits a seventh as far as quantizing the projections does (mean |Δ| 0.019
+  against 0.134), since the head applies once where a projection's error
+  compounds through 48 layers. Refused for tied word embeddings, which
   quantizing the head would untie. `--attn-block-size` is now
   `--weight-block-size` (the old name still works) since both features share
   it.
