@@ -444,6 +444,7 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+        self._gqa_fused_rope = getattr(config, "gqa_fused_rope", False)
         self.lm_head = _lm_head_class(config)(
             config.hidden_size, config.vocab_size, bias=False
         )

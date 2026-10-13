@@ -379,6 +379,24 @@ class Attention(nn.Module):
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
 
+        # Folded path: GQA takes the norm weights and the rotary tables and does
+        # both inside the kernel, so neither is emitted here. The per-head norm
+        # is the only form it implements, and it runs before the rotary, which
+        # is the order this module uses too.
+        if (
+            static_cache is not None
+            and static_cache.seqlens_k is not None
+            and isinstance(attention_bias, GQAContext)
+        ):
+            if self.q_norm is None or self.k_norm is None or self._qk_norm_full:
+                raise ValueError(
+                    "fused GQA rotary expects per-head Q/K norm; this attention "
+                    f"has qk_norm={self.q_norm is not None}, full={self._qk_norm_full}"
+                )
+            return self._forward_gqa_static(
+                op, query_states, key_states, value_states, attention_bias, static_cache
+            )
+
         if self.q_norm is not None and self.k_norm is not None:
             if self._qk_norm_full:
                 # Apply norm on 3D tensor (across all heads)
@@ -465,6 +483,71 @@ class Attention(nn.Module):
     def _project_output(self, op: OpBuilder, attn_output: ir.Value) -> ir.Value:
         """Apply architecture-specific processing before the output projection."""
         return self.o_proj(op, attn_output)
+
+    def _forward_gqa_static(
+        self,
+        op: OpBuilder,
+        query_states: ir.Value,
+        key_states: ir.Value,
+        value_states: ir.Value,
+        gqa_ctx: GQAContext,
+        static_cache: StaticCacheState,
+    ):
+        """Emit GQA over a static cache with the Q/K norm and rotary inside it.
+
+        Replaces, per layer, two ``RMSNormalization`` and two
+        ``RotaryEmbedding`` nodes. At one token those read 8 KB, so they cost
+        what a launch costs rather than what the data costs -- about 3 us each
+        on an A100, where doing both inside the kernel measures 1 us per layer.
+        """
+        attrs: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scaling,
+            "do_rotary": 1,
+            "rotary_interleaved": int(self._rope_interleave),
+            "qk_norm_epsilon": self.q_norm.variance_epsilon,
+        }
+        if self._softcap:
+            attrs["softcap"] = self._softcap
+        if self.rotary_embedding_dim:
+            attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+        if gqa_ctx.local_window_size > 0:
+            attrs["local_window_size"] = gqa_ctx.local_window_size
+
+        # The norm weights go straight into the op, so their modules are never
+        # called and onnxscript never registers the parameters. Realize them in
+        # their own scope, which is also what gives them qualified names.
+        norm_weights = []
+        for norm in (self.q_norm, self.k_norm):
+            op.builder.push_module(norm.name or "norm", type(norm).__qualname__)
+            try:
+                norm.weight._realize(op.builder)
+            finally:
+                op.builder.pop_module()
+            norm_weights.append(norm.weight)
+
+        attn_out, present_key, present_value = op.GroupQueryAttention(  # type: ignore[attr-defined]
+            query_states,
+            key_states,
+            value_states,
+            static_cache.key_cache,
+            static_cache.value_cache,
+            static_cache.seqlens_k,
+            static_cache.total_seq_len,
+            gqa_ctx.cos_cache,
+            gqa_ctx.sin_cache,
+            None,  # position_ids: derived from seqlens_k
+            None,  # attention_bias
+            None,  # head_sink
+            None,  # k_scale
+            None,  # v_scale
+            *norm_weights,
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
+        )
+        return self._project_output(op, attn_out), (present_key, present_value)
 
     def _forward_gqa(
         self,

@@ -755,3 +755,86 @@ def test_gqa_cache_and_quantized_weights_combine(omni):
         "position_ids",
         "nonpad_kv_seqlen",
     }
+
+
+def test_gqa_fused_rope_matches_separate_ops(omni):
+    """GQA's inline Q/K norm and rotary replace the separate ops.
+
+    The node census is checked everywhere; the logits are only compared where
+    a CUDA provider is present, because ORT implements the per-head Q/K norm
+    prologue on CUDA and WebGPU but not on the CPU EP.
+    """
+    config, hf_model, _ = omni
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+
+    builds = {}
+    for name, fused in (("separate", False), ("fused", True)):
+        variant = dataclasses.replace(config, gqa_fused_rope=fused)
+        module = Qwen3OmniThinkerForConditionalGeneration(variant)
+        package = build_from_module(
+            module,
+            variant,
+            task=SpeechLanguageTask(
+                static_cache=True, max_seq_len=_STATIC_MAX_SEQ_LEN, gqa_cache=True
+            ),
+        )
+        package.apply_weights(module.preprocess_weights(state_dict))
+        builds[name] = package["decoder"]
+
+    separate, fused = builds["separate"], builds["fused"]
+    counts = {
+        name: collections.Counter(n.op_type for n in graph.graph.all_nodes())
+        for name, graph in (("separate", separate), ("fused", fused))
+    }
+    # Two norms and two rotaries per layer move inside the op.
+    assert counts["fused"]["RotaryEmbedding"] == 0
+    assert counts["separate"]["RotaryEmbedding"] == 2 * config.num_hidden_layers
+    assert (
+        counts["separate"]["RMSNormalization"] - counts["fused"]["RMSNormalization"]
+        == 2 * config.num_hidden_layers
+    )
+
+    import onnxruntime as ort
+
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        pytest.skip("the fused Q/K norm prologue is CUDA/WebGPU only")
+
+    rng = np.random.default_rng(23)
+    prompt = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float32)
+    steps = [prompt] + [
+        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float32) for _ in range(3)
+    ]
+    layers = range(config.num_hidden_layers)
+    kv_heads, head_dim = config.num_key_value_heads, config.head_dim
+
+    def empty_cache():
+        return {
+            f"{kind}_cache.{i}": np.zeros(
+                (1, kv_heads, _STATIC_MAX_SEQ_LEN, head_dim), np.float32
+            )
+            for i in layers
+            for kind in ("key", "value")
+        }
+
+    caches = {"separate": empty_cache(), "fused": empty_cache()}
+    past_len = 0
+    for embeds in steps:
+        seq = embeds.shape[1]
+        pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+        # The fused rotary is 1-D, so this only holds where the three mRoPE
+        # axes agree -- audio and text, which is all the thinker exports.
+        feeds = {
+            "inputs_embeds": embeds,
+            "position_ids": np.stack([pos, pos, pos])[:, None, :],
+            "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+        }
+        outputs = {
+            name: _run(graph, {**feeds, **caches[name]})
+            for name, graph in (("separate", separate), ("fused", fused))
+        }
+        np.testing.assert_allclose(
+            outputs["fused"]["logits"], outputs["separate"]["logits"], rtol=2e-3, atol=2e-3
+        )
+        for name in caches:
+            caches[name] = {n: outputs[name][f"updated_{n}"] for n in caches[name]}
+        past_len += seq

@@ -737,6 +737,14 @@ class ArchitectureConfig(BaseModelConfig):
     # semantic geometry (see ``mobius.components._paged_mla``), never model names;
     # an incompatible geometry raises rather than silently falling back.
     export_paged_attention: bool = False
+    # Fold the per-head Q/K norm and the rotary into
+    # ``com.microsoft::GroupQueryAttention`` (its ``q_norm_weight`` /
+    # ``k_norm_weight`` inputs and ``do_rotary=1``) instead of emitting them as
+    # separate ops. Only valid on the GQA static-cache path, and only while
+    # position_ids carry the same value on all three mRoPE axes -- the fused
+    # rotary is 1-D, which mRoPE degenerates to for audio and text but not for
+    # images. Default off.
+    gqa_fused_rope: bool = False
     # Opt-in weight-only quantization of the attention projections at export
     # time, for checkpoints that store them in float. ``None`` keeps them float
     # (the default, and exports are unchanged). ``8`` emits

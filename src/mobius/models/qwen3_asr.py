@@ -492,6 +492,7 @@ class Qwen3ASRDecoderModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
+        self._gqa_fused_rope = getattr(config, "gqa_fused_rope", False)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
@@ -516,6 +517,21 @@ class Qwen3ASRDecoderModel(nn.Module):
             if attention_mask is not None
             else None
         )
+
+        if getattr(self, "_gqa_fused_rope", False):
+            # Hand the rotary tables to GroupQueryAttention, which also takes
+            # the per-head norm weights, and emit neither op per layer. The
+            # gathered embeddings above are discarded; calling rotary_emb still
+            # realizes cos_cache / sin_cache as initializers.
+            from mobius.components._attention import GQAContext
+
+            attention_bias = GQAContext(
+                seqlens_k=None,  # the static cache carries these
+                total_seq_len=None,
+                cos_cache=self.rotary_emb.cos_cache,
+                sin_cache=self.rotary_emb.sin_cache,
+            )
+            position_embeddings = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)

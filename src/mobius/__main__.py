@@ -38,6 +38,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "glm-full-attention": "glm_full_attention",
     "paged-attention": "export_paged_attention",
     "gqa-cache": "gqa_cache",
+    "gqa-fused-rope": "gqa_fused_rope",
     "attn-int8": "attn_int8",
     "lm-head-int8": "lm_head_int8",
 }
@@ -204,6 +205,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"Error: --weight-block-size must be a power of two >= 16, got {block}."
             )
+
+    # The fused prologue lives in the GQA node, so there has to be one.
+    if args.gqa_fused_rope and not args.gqa_cache:
+        raise SystemExit(
+            "Error: --features gqa-fused-rope folds the Q/K norm and the rotary "
+            "into GroupQueryAttention; pass --features static-cache,gqa-cache,"
+            "gqa-fused-rope."
+        )
 
     # GQA owns the cache it is given, so there has to be one.
     if args.gqa_cache and not args.static_cache:
@@ -412,6 +421,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 prune_prefill_prefix=prune_prefill_prefix,
                 glm_full_attention=args.glm_full_attention,
                 export_paged_attention=export_paged_attention,
+                gqa_fused_rope=getattr(args, "gqa_fused_rope", False),
                 attn_weight_bits=8 if args.attn_int8 else None,
                 lm_head_weight_bits=8 if args.lm_head_int8 else None,
                 weight_quant_block_size=args.weight_block_size,
@@ -481,6 +491,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            gqa_fused_rope=getattr(args, "gqa_fused_rope", False),
             attn_weight_bits=8 if args.attn_int8 else None,
             lm_head_weight_bits=8 if args.lm_head_int8 else None,
             weight_quant_block_size=args.weight_block_size,
@@ -519,6 +530,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            gqa_fused_rope=getattr(args, "gqa_fused_rope", False),
             attn_weight_bits=8 if args.attn_int8 else None,
             lm_head_weight_bits=8 if args.lm_head_int8 else None,
             weight_quant_block_size=args.weight_block_size,

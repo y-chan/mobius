@@ -295,6 +295,7 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
+    gqa_fused_rope: bool = False,
     attn_weight_bits: int | None = None,
     lm_head_weight_bits: int | None = None,
     weight_quant_block_size: int = 128,
@@ -568,6 +569,8 @@ def build_transformers_model(
                 "('glm_moe_dsa') checkpoints."
             )
         config = dataclasses.replace(config, use_dsa=False)
+    if gqa_fused_rope:
+        config = dataclasses.replace(config, gqa_fused_rope=True)
     if export_paged_attention:
         from mobius.components._paged_mla import paged_attention_rejection
 
