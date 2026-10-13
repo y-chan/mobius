@@ -42,9 +42,15 @@ fusions), and the EP decides two things that matter here:
   fallback materialises 18k expert tensors for this checkpoint and spends
   about twenty minutes in session initialisation.
 
+`--features lm-head-int8` does the same for the LM head. It is a smaller
+prize and a worse risk: one GEMV per step against the projections' 48, already
+running at 1.6 TB/s, and its error reaches the logits without passing through
+another layer. It refuses a checkpoint with tied word embeddings, where
+quantizing the head would untie it and store the vocabulary twice.
+
 `--features attn-int8` quantizes the two attention projections at export
 time and emits `com.microsoft::MatMulNBits` (8-bit, symmetric, one scale per
-`--attn-block-size` input features, no zero-points) in place of the float
+`--weight-block-size` input features, no zero-points) in place of the float
 matmul. This is weight-only -- W8A16: the op dequantizes the weight and
 computes in the activation's dtype, and nothing quantizes the activations.
 W8A8 is not on offer because ORT's CUDA EP has no fast kernel for it
@@ -261,7 +267,7 @@ than 4 bits, so the 8-bit path stays weight-only on every EP.
 The scale is rounded to the model dtype *before* the weights are divided by
 it, so the stored integers fit the scale the kernel will actually read.
 
-`--attn-block-size` trades weight error against almost nothing. The payload is
+`--weight-block-size` trades weight error against almost nothing. The payload is
 one byte per weight whatever the block, so only the scales change size, and at
 block 128 they are 1.6% of a projection's bytes. Measured over 6 layers of the
 thinker, and end to end on Blackwell:

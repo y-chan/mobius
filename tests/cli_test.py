@@ -882,13 +882,14 @@ class TestCLIBuild:
                     "f16",
                     "--features",
                     "attn-int8",
-                    "--attn-block-size",
+                    "--weight-block-size",
                     "64",
                 ]
             )
         kwargs = mock_build.call_args.kwargs
         assert kwargs.get("attn_weight_bits") == 8
-        assert kwargs.get("attn_weight_block_size") == 64
+        assert kwargs.get("lm_head_weight_bits") is None
+        assert kwargs.get("weight_quant_block_size") == 64
 
     def test_attn_int8_requires_fp16(self):
         """MatMulNBits' CUDA kernel reads fp16 scales, so bf16 is refused."""
@@ -913,7 +914,7 @@ class TestCLIBuild:
     def test_attn_block_size_must_be_a_power_of_two(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            pytest.raises(SystemExit, match=r"--attn-block-size must be a power of two"),
+            pytest.raises(SystemExit, match=r"--weight-block-size must be a power of two"),
         ):
             main(
                 [
@@ -926,7 +927,7 @@ class TestCLIBuild:
                     "f16",
                     "--features",
                     "attn-int8",
-                    "--attn-block-size",
+                    "--weight-block-size",
                     "100",
                 ]
             )

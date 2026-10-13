@@ -745,7 +745,14 @@ class ArchitectureConfig(BaseModelConfig):
     # smaller for the Qwen3-Omni thinker, at a ~4% slower prefill. Only the
     # projections are affected; routed experts and the LM head are not.
     export_attn_weight_bits: int | None = None
-    export_attn_weight_block_size: int = 128
+    # Same, for the LM head. Separate because the trade is different: a
+    # projection's error is attenuated through the residual stream, while the
+    # head's lands on the logits directly, and the head is one GEMV against 48.
+    export_lm_head_weight_bits: int | None = None
+    # Input features per scale, shared by both. The payload is one byte per
+    # weight whatever this is, so it only changes the scales' size (1.6% of a
+    # projection's bytes at 128) and the quantization error.
+    export_weight_quant_block_size: int = 128
     # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
     # top-k selection from the closest preceding "full" layer). When the
     # checkpoint config omits this list, it is derived from

@@ -39,6 +39,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "paged-attention": "export_paged_attention",
     "gqa-cache": "gqa_cache",
     "attn-int8": "attn_int8",
+    "lm-head-int8": "lm_head_int8",
 }
 
 
@@ -186,17 +187,22 @@ def _cmd_build(args: argparse.Namespace) -> None:
     _resolve_build_features(args)
 
     # MatMulNBits' CUDA kernel reads fp16 scales, so the build dtype decides
-    # whether the quantized projections can run at all.
-    if args.attn_int8:
+    # whether the quantized weights can run at all.
+    if args.attn_int8 or args.lm_head_int8:
+        requested = ",".join(
+            name
+            for name, on in (("attn-int8", args.attn_int8), ("lm-head-int8", args.lm_head_int8))
+            if on
+        )
         if args.dtype not in ("f16", "float16"):
             raise SystemExit(
-                "Error: --features attn-int8 requires --dtype f16 (got "
+                f"Error: --features {requested} requires --dtype f16 (got "
                 f"'{args.dtype}'); ORT's MatMulNBits CUDA kernel reads fp16 scales."
             )
-        block = args.attn_block_size
+        block = args.weight_block_size
         if block < 16 or block & (block - 1):
             raise SystemExit(
-                f"Error: --attn-block-size must be a power of two >= 16, got {block}."
+                f"Error: --weight-block-size must be a power of two >= 16, got {block}."
             )
 
     # GQA owns the cache it is given, so there has to be one.
@@ -407,7 +413,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 glm_full_attention=args.glm_full_attention,
                 export_paged_attention=export_paged_attention,
                 attn_weight_bits=8 if args.attn_int8 else None,
-                attn_weight_block_size=args.attn_block_size,
+                lm_head_weight_bits=8 if args.lm_head_int8 else None,
+                weight_quant_block_size=args.weight_block_size,
                 keep_quantized=keep_quantized,
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
@@ -475,7 +482,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             attn_weight_bits=8 if args.attn_int8 else None,
-            attn_weight_block_size=args.attn_block_size,
+            lm_head_weight_bits=8 if args.lm_head_int8 else None,
+            weight_quant_block_size=args.weight_block_size,
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
@@ -512,7 +520,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             attn_weight_bits=8 if args.attn_int8 else None,
-            attn_weight_block_size=args.attn_block_size,
+            lm_head_weight_bits=8 if args.lm_head_int8 else None,
+            weight_quant_block_size=args.weight_block_size,
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
@@ -1381,13 +1390,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Defaults to max_position_embeddings from config.",
     )
     build_parser.add_argument(
+        "--weight-block-size",
         "--attn-block-size",
+        dest="weight_block_size",
         type=int,
         default=128,
         metavar="N",
-        help="Input features per weight-quantization scale for the attention "
-        "projections. Only used with --features attn-int8. Must be a power of "
-        "two >= 16 and divide every projection's input dimension. Default 128.",
+        help="Input features per weight-quantization scale. Only used with "
+        "--features attn-int8 / lm-head-int8. Must be a power of two >= 16 and "
+        "divide every quantized weight's input dimension. Default 128.",
     )
     build_parser.add_argument(
         "--runtime",

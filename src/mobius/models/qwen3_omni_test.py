@@ -589,7 +589,7 @@ def test_attention_projections_quantize_to_matmulnbits(omni):
     config, hf_model, _ = omni
     state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
     quantized_config = dataclasses.replace(
-        config, export_attn_weight_bits=8, export_attn_weight_block_size=_ATTN_BLOCK
+        config, export_attn_weight_bits=8, export_weight_quant_block_size=_ATTN_BLOCK
     )
 
     packages = {}
@@ -639,3 +639,74 @@ def test_attention_projections_quantize_to_matmulnbits(omni):
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def test_lm_head_quantizes_to_matmulnbits(omni):
+    """The 8-bit head matches the same weight dequantized into the float graph."""
+    config, hf_model, _ = omni
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+    quantized_config = dataclasses.replace(
+        config,
+        export_lm_head_weight_bits=8,
+        export_weight_quant_block_size=_ATTN_BLOCK,
+    )
+    module = Qwen3OmniThinkerForConditionalGeneration(quantized_config)
+    package = build_from_module(module, quantized_config, task=SpeechLanguageTask())
+    package.apply_weights(module.preprocess_weights(state_dict))
+
+    decoder = package["decoder"]
+    counts = collections.Counter(n.op_type for n in decoder.graph.all_nodes())
+    # Only the head: the projections stay float without --features attn-int8.
+    assert counts["MatMulNBits"] == 1
+    payload = next(
+        i for i in decoder.graph.initializers.values() if i.name.endswith("lm_head.weight")
+    )
+    assert payload.dtype == ir.DataType.UINT8
+    assert payload.shape.dims == (
+        config.vocab_size,
+        config.hidden_size // _ATTN_BLOCK,
+        _ATTN_BLOCK,
+    )
+
+    # Feed the float graph the head's weight after a quantization round trip.
+    reference = Qwen3OmniThinkerForConditionalGeneration(config)
+    reference_package = build_from_module(reference, config, task=SpeechLanguageTask())
+    weights = reference.preprocess_weights(state_dict)
+    head = weights["decoder.lm_head.weight"]
+    head_payload, head_scales = quantize_linear_int8_blocks(head, block_size=_ATTN_BLOCK)
+    rows, n_blocks, _ = head_payload.shape
+    weights["decoder.lm_head.weight"] = (
+        ((head_payload.float() - 128) * head_scales.float().reshape(rows, n_blocks, 1))
+        .reshape(rows, -1)
+        .to(head.dtype)
+    )
+    reference_package.apply_weights(weights)
+
+    rng = np.random.default_rng(17)
+    embeds = rng.standard_normal((1, 4, config.hidden_size)).astype(np.float32)
+    pos = np.arange(embeds.shape[1], dtype=np.int64)
+    feeds = {
+        "inputs_embeds": embeds,
+        "attention_mask": np.ones((1, embeds.shape[1]), np.int64),
+        "position_ids": np.stack([pos, pos, pos])[:, None, :],
+        **{
+            f"past_key_values.{i}.{kind}": np.zeros(
+                (1, config.num_key_value_heads, 0, config.head_dim), np.float32
+            )
+            for i in range(config.num_hidden_layers)
+            for kind in ("key", "value")
+        },
+    }
+    np.testing.assert_allclose(
+        _run(decoder, feeds)["logits"],
+        _run(reference_package["decoder"], feeds)["logits"],
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_lm_head_quantization_rejects_tied_embeddings(omni):
+    config, _, _ = omni
+    tied = dataclasses.replace(config, tie_word_embeddings=True, export_lm_head_weight_bits=8)
+    with pytest.raises(ValueError, match="tied word"):
+        Qwen3OmniThinkerForConditionalGeneration(tied)

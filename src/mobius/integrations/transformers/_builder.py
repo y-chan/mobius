@@ -296,7 +296,8 @@ def build_transformers_model(
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
     attn_weight_bits: int | None = None,
-    attn_weight_block_size: int = 128,
+    lm_head_weight_bits: int | None = None,
+    weight_quant_block_size: int = 128,
     input_sampling_rate: int | None = None,
     bwe_sampling_rate: int | None = None,
 ) -> ModelPackage:
@@ -577,16 +578,18 @@ def build_transformers_model(
                 "export_paged_attention=True (--features paged-attention) is not "
                 f"supported for model_type '{model_type}': {reason}"
             )
-    if attn_weight_bits is not None:
+    if attn_weight_bits is not None or lm_head_weight_bits is not None:
         if config.dtype is not ir.DataType.FLOAT16:
             raise ValueError(
-                "attn_weight_bits requires --dtype f16: ORT's MatMulNBits CUDA "
-                f"kernel reads fp16 scales, and this build is {config.dtype.name}."
+                "weight-only quantization requires --dtype f16: ORT's "
+                "MatMulNBits CUDA kernel reads fp16 scales, and this build is "
+                f"{config.dtype.name}."
             )
         config = dataclasses.replace(
             config,
             export_attn_weight_bits=attn_weight_bits,
-            export_attn_weight_block_size=attn_weight_block_size,
+            export_lm_head_weight_bits=lm_head_weight_bits,
+            export_weight_quant_block_size=weight_quant_block_size,
         )
     if task is None:
         task = _default_task_for_model(model_type)

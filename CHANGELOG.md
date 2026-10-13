@@ -32,9 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value_cache.{i}` buffers with `write_indices` and `nonpad_kv_seqlen`
   instead of growing `past_key_values` and `attention_mask`, so single-token
   decode steps have fixed shapes and can be replayed from a CUDA graph.
+- `--features lm-head-int8` quantizes the LM head the same way. Separate from
+  `attn-int8` because the trade differs: one GEMV per step against 48, already
+  near the memory roofline, and the error reaches the logits directly rather
+  than through another layer. Refused for tied word embeddings, which
+  quantizing the head would untie. `--attn-block-size` is now
+  `--weight-block-size` (the old name still works) since both features share
+  it.
 - `--features attn-int8` quantizes a decoder's attention projections at export
   time and emits them as `com.microsoft::MatMulNBits` (8-bit, symmetric, one
-  scale per `--attn-block-size` input features, no zero-points) instead of a
+  scale per `--weight-block-size` input features, no zero-points) instead of a
   float `MatMul`. Unlike the GPTQ / AWQ / Olive paths this adds quantization
   rather than carrying the checkpoint's own, so it quantizes in
   `preprocess_weights` from whatever dtype the checkpoint holds. Mean relative

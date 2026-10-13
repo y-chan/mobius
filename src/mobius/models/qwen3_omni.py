@@ -145,7 +145,46 @@ def _attention_linear_class(config: ArchitectureConfig) -> type:
         return TransposedLinear
     return make_quantized_linear_factory(
         bits=bits,
-        block_size=config.export_attn_weight_block_size,
+        block_size=config.export_weight_quant_block_size,
+        has_zero_point=False,
+    )
+
+
+def _quantize_named_weight(
+    state_dict: dict[str, torch.Tensor], prefix: str, *, bits: int, block_size: int
+) -> dict[str, torch.Tensor]:
+    """Replace one float weight with a ``MatMulNBits`` payload and its scales."""
+    if bits != 8:
+        raise ValueError(f"only 8-bit weight quantization is implemented, got {bits}")
+    key = f"{prefix}.weight"
+    if key not in state_dict:
+        raise ValueError(f"{key} is not in the mapped weights, so it cannot be quantized")
+    payload, scales = quantize_linear_int8_blocks(state_dict.pop(key), block_size=block_size)
+    state_dict[key] = payload
+    state_dict[f"{prefix}.scales"] = scales
+    return state_dict
+
+
+def _lm_head_class(config: ArchitectureConfig) -> type:
+    """Projection class for the LM head.
+
+    ``export_lm_head_weight_bits`` makes it a ``MatMulNBits`` too. It is a
+    smaller prize than the attention projections and a worse risk: one GEMV
+    per step against 48, already running near the memory roofline, and its
+    error reaches the logits without passing through another layer.
+    """
+    bits = config.export_lm_head_weight_bits
+    if bits is None:
+        return Linear
+    if config.tie_word_embeddings:
+        raise ValueError(
+            "export_lm_head_weight_bits cannot be used with tied word "
+            "embeddings: quantizing the head would untie it from the "
+            "embedding table and store the vocabulary twice"
+        )
+    return make_quantized_linear_factory(
+        bits=bits,
+        block_size=config.export_weight_quant_block_size,
         has_zero_point=False,
     )
 
@@ -404,7 +443,9 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _lm_head_class(config)(
+            config.hidden_size, config.vocab_size, bias=False
+        )
 
 
 class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
@@ -530,11 +571,19 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
 
         # Last, so the checkpoint's own quantized tensors are already in their
         # final names and nothing here is mistaken for one of them.
+        block_size = self.config.export_weight_quant_block_size
         if self.config.export_attn_weight_bits is not None:
             result = _quantize_attention_projections(
                 result,
                 bits=self.config.export_attn_weight_bits,
-                block_size=self.config.export_attn_weight_block_size,
+                block_size=block_size,
+            )
+        if self.config.export_lm_head_weight_bits is not None:
+            result = _quantize_named_weight(
+                result,
+                "decoder.lm_head",
+                bits=self.config.export_lm_head_weight_bits,
+                block_size=block_size,
             )
 
         return result
