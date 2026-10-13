@@ -244,10 +244,11 @@ is the one thing GQA cannot express.
 
 `--features attn-int8` is the one place where mobius adds quantization rather
 than carrying the checkpoint's own. The weights are quantized in
-`preprocess_weights`, from whatever dtype the checkpoint stores — bf16 for
-this model — which is why it is a build feature and not a post-export rewrite:
-quantizing an already-narrowed fp16 copy costs accuracy (0.9% mean relative
-error against 0.69% from bf16, at block 128).
+`preprocess_weights`, from whatever dtype the checkpoint stores. For this
+model that costs nothing either way — bf16 has 8 mantissa bits against fp16's
+10, so the fp16 export holds the same values — but it is where a checkpoint
+whose dtype a narrowed export *would* round belongs, and it keeps the
+quantization out of a post-export rewrite.
 
 The emission is `QuantizedLinear`, the component the GPTQ and AWQ paths
 already use, injected through `linear_class`. At 8 bits nothing is bit-packed,
@@ -258,8 +259,23 @@ the one that would turn this into W8A8 on CPU -- is omitted for anything other
 than 4 bits, so the 8-bit path stays weight-only on every EP.
 
 The scale is rounded to the model dtype *before* the weights are divided by
-it, so the stored integers fit the scale the kernel will actually read. Mean
-relative weight error is 0.69%, worst 0.91%, at block 128.
+it, so the stored integers fit the scale the kernel will actually read.
+
+`--attn-block-size` trades weight error against almost nothing. The payload is
+one byte per weight whatever the block, so only the scales change size, and at
+block 128 they are 1.6% of a projection's bytes. Measured over 6 layers of the
+thinker, and end to end on Blackwell:
+
+| block | mean error | worst | decoder `Run` |
+|---|---|---|---|
+| 64 | 0.66% | 0.81% | 4.884 ms |
+| 128 (default) | 0.73% | 0.93% | 4.862 ms |
+| 256 | 0.81% | 1.05% | not measured |
+
+So the kernel does not care about the block size — 64 costs the 0.45% its
+extra scale traffic predicts, nothing more — and the default is 128 only
+because that is the size the end-to-end quality study below used. A study at
+64 would be the thing that justifies moving it.
 
 What this does to the output has only been checked on one clip of 300 steps:
 against the float export, the argmax agrees at 99.0% of positions and the

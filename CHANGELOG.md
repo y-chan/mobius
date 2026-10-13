@@ -36,9 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time and emits them as `com.microsoft::MatMulNBits` (8-bit, symmetric, one
   scale per `--attn-block-size` input features, no zero-points) instead of a
   float `MatMul`. Unlike the GPTQ / AWQ / Olive paths this adds quantization
-  rather than carrying the checkpoint's own, so it quantizes from the
-  checkpoint's dtype: for the Qwen3-Omni thinker, from bf16 rather than from
-  the fp16 export, which is 0.69% mean relative weight error instead of 0.9%.
+  rather than carrying the checkpoint's own, so it quantizes in
+  `preprocess_weights` from whatever dtype the checkpoint holds. Mean relative
+  weight error on the thinker's projections is 0.73% at the default block of
+  128, 0.66% at 64 and 0.81% at 256; the block size costs nothing but scale
+  traffic, so 64 is 0.45% slower and nothing else.
   A decode step goes 6.81 → 6.43 ms (147 → 155 tokens/s) on an A100 with the
   GQA cache, and 6.51 → 6.01 ms (154 → 167 tokens/s) on an RTX PRO 6000 with
   the static cache, while the decoder's weights shrink by 0.9 GB; prefill is
