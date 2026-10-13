@@ -796,8 +796,10 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
 
     import onnxruntime as ort
 
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
-        pytest.skip("the fused Q/K norm prologue is CUDA/WebGPU only")
+    # Some installs reach their CUDA libraries only after this call, and
+    # get_available_providers() lists the EP either way, so whether CUDA is
+    # really usable is decided below from the session's own provider list.
+    ort.preload_dlls()
 
     rng = np.random.default_rng(23)
     prompt = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float32)
@@ -823,6 +825,8 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
         for name, graph in (("separate", separate), ("fused", fused))
     }
     try:
+        if "CUDAExecutionProvider" not in sessions["fused"].providers:
+            pytest.skip("the fused Q/K norm prologue is CUDA/WebGPU only")
         past_len = 0
         for embeds in steps:
             seq = embeds.shape[1]
