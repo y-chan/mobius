@@ -769,7 +769,10 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
 
     builds = {}
     for name, fused in (("separate", False), ("fused", True)):
-        variant = dataclasses.replace(config, gqa_fused_rope=fused)
+        # float16: the CUDA GroupQueryAttention kernel is registered for the
+        # half types only, and a float32 node falls back to the CPU
+        # implementation, which has no norm prologue to compare against.
+        variant = dataclasses.replace(config, gqa_fused_rope=fused, dtype=ir.DataType.FLOAT16)
         module = Qwen3OmniThinkerForConditionalGeneration(variant)
         package = build_from_module(
             module,
@@ -802,9 +805,9 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
     ort.preload_dlls()
 
     rng = np.random.default_rng(23)
-    prompt = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float32)
+    prompt = rng.standard_normal((1, 5, config.hidden_size)).astype(np.float16)
     steps = [prompt] + [
-        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float32) for _ in range(3)
+        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float16) for _ in range(3)
     ]
     layers = range(config.num_hidden_layers)
     kv_heads, head_dim = config.num_key_value_heads, config.head_dim
@@ -812,7 +815,7 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
     def empty_cache():
         return {
             f"{kind}_cache.{i}": np.zeros(
-                (1, kv_heads, _STATIC_MAX_SEQ_LEN, head_dim), np.float32
+                (1, kv_heads, _STATIC_MAX_SEQ_LEN, head_dim), np.float16
             )
             for i in layers
             for kind in ("key", "value")
@@ -845,8 +848,10 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
             np.testing.assert_allclose(
                 outputs["fused"]["logits"],
                 outputs["separate"]["logits"],
-                rtol=2e-3,
-                atol=2e-3,
+                # Both sides are float16; what is being compared is where the
+                # norm and the rotary happen, not the arithmetic's precision.
+                rtol=2e-2,
+                atol=2e-2,
             )
             for name in caches:
                 caches[name] = {n: outputs[name][f"updated_{n}"] for n in caches[name]}
