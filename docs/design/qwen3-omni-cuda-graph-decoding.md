@@ -45,7 +45,11 @@ fusions), and the EP decides two things that matter here:
 `--features attn-int8` quantizes the two attention projections at export
 time and emits `com.microsoft::MatMulNBits` (8-bit, symmetric, one scale per
 `--attn-block-size` input features, no zero-points) in place of the float
-matmul. Routed experts and the LM head are untouched. It requires `--dtype
+matmul. This is weight-only -- W8A16: the op dequantizes the weight and
+computes in the activation's dtype, and nothing quantizes the activations.
+W8A8 is not on offer because ORT's CUDA EP has no fast kernel for it
+(`DynamicQuantizeLinear` is unimplemented there and `MatMulInteger` is slow).
+Routed experts and the LM head are untouched. It requires `--dtype
 f16`, since ORT's MatMulNBits CUDA kernel reads fp16 scales, and the build
 refuses bf16 rather than emitting a graph that cannot run.
 
@@ -247,9 +251,11 @@ error against 0.69% from bf16, at block 128).
 
 The emission is `QuantizedLinear`, the component the GPTQ and AWQ paths
 already use, injected through `linear_class`. At 8 bits nothing is bit-packed,
-so its `[N, n_blocks, blob_size]` payload is exactly `[out, in/block, block]`,
-and `accuracy_level` is omitted for anything other than 4 bits. Zero-points
-are left off so the op uses its implicit 128.
+so its `[N, n_blocks, blob_size]` payload is exactly `[out, in/block, block]`.
+Zero-points are left off so the op uses its implicit 128. `accuracy_level` --
+the attribute that makes ORT's MLAS kernel quantize activations to int8, i.e.
+the one that would turn this into W8A8 on CPU -- is omitted for anything other
+than 4 bits, so the 8-bit path stays weight-only on every EP.
 
 The scale is rounded to the model dtype *before* the weights are divided by
 it, so the stored integers fit the scale the kernel will actually read. Mean
