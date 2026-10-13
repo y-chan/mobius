@@ -817,24 +817,36 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
         }
 
     caches = {"separate": empty_cache(), "fused": empty_cache()}
-    past_len = 0
-    for embeds in steps:
-        seq = embeds.shape[1]
-        pos = np.arange(past_len, past_len + seq, dtype=np.int64)
-        # The fused rotary is 1-D, so this only holds where the three mRoPE
-        # axes agree -- audio and text, which is all the thinker exports.
-        feeds = {
-            "inputs_embeds": embeds,
-            "position_ids": np.stack([pos, pos, pos])[:, None, :],
-            "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
-        }
-        outputs = {
-            name: _run(graph, {**feeds, **caches[name]})
-            for name, graph in (("separate", separate), ("fused", fused))
-        }
-        np.testing.assert_allclose(
-            outputs["fused"]["logits"], outputs["separate"]["logits"], rtol=2e-3, atol=2e-3
-        )
-        for name in caches:
-            caches[name] = {n: outputs[name][f"updated_{n}"] for n in caches[name]}
-        past_len += seq
+    # The prologue only exists on the CUDA EP, so both sides run there.
+    sessions = {
+        name: OnnxModelSession(graph, device="cuda")
+        for name, graph in (("separate", separate), ("fused", fused))
+    }
+    try:
+        past_len = 0
+        for embeds in steps:
+            seq = embeds.shape[1]
+            pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+            # The fused rotary is 1-D, so this only holds where the three mRoPE
+            # axes agree -- audio and text, which is all the thinker exports.
+            feeds = {
+                "inputs_embeds": embeds,
+                "position_ids": np.stack([pos, pos, pos])[:, None, :],
+                "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+            }
+            outputs = {
+                name: session.run({**feeds, **caches[name]})
+                for name, session in sessions.items()
+            }
+            np.testing.assert_allclose(
+                outputs["fused"]["logits"],
+                outputs["separate"]["logits"],
+                rtol=2e-3,
+                atol=2e-3,
+            )
+            for name in caches:
+                caches[name] = {n: outputs[name][f"updated_{n}"] for n in caches[name]}
+            past_len += seq
+    finally:
+        for session in sessions.values():
+            session.close()
