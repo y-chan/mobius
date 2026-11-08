@@ -23,6 +23,7 @@ from onnx_ir import tensor_adapters
 from mobius._builder import build_from_module
 from mobius._testing import make_config
 from mobius.integrations._weight_loading import (
+    StreamingTransformedBankSource,
     StreamingTransformedWeightSource,
     StreamingWeightPlan,
     _shard_key_index,
@@ -331,6 +332,111 @@ class TestStreamingRefusals:
         assert target.const_value is not None
         with pytest.raises(ValueError, match="contains a negative value"):
             target.const_value.numpy()
+        assert transform_calls == []
+
+    @staticmethod
+    def _bank_model() -> tuple[ir.Model, ir.Value]:
+        target = ir.Value(
+            name="bank",
+            type=ir.TensorType(ir.DataType.INT32),
+            shape=ir.Shape([2, 4, 3]),
+            const_value=ir.tensor(torch.zeros(2, 4, 3, dtype=torch.int32)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="bank")
+        graph.register_initializer(target)
+        target.const_value = None
+        return ir.Model(graph, ir_version=12), target
+
+    def test_transformed_bank_interleaves_sources_across_shards(self, tmp_path):
+        # Four [2, 3] sources: experts 0 and 1, each a (gate, up) pair, split
+        # across two shards so the per-shard grouping is exercised.
+        sources = {
+            f"e{e}.{p}": torch.arange(6, dtype=torch.int32).reshape(2, 3) + 100 * e + 10 * i
+            for e in range(2)
+            for i, p in enumerate(("gate", "up"))
+        }
+        names = tuple(sources)
+        safetensors.torch.save_file(
+            {n: sources[n] for n in names[:2]}, str(tmp_path / "a.safetensors")
+        )
+        safetensors.torch.save_file(
+            {n: sources[n] for n in names[2:]}, str(tmp_path / "b.safetensors")
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        **dict.fromkeys(names[:2], "a.safetensors"),
+                        **dict.fromkeys(names[2:], "b.safetensors"),
+                    }
+                }
+            )
+        )
+        model, target = self._bank_model()
+
+        def interleave(tensors):
+            pairs = [torch.stack(tensors[i : i + 2], dim=1).reshape(4, 3) for i in (0, 2)]
+            return torch.stack(pairs)
+
+        def planner(_key_index, _initializers):
+            return StreamingWeightPlan(
+                targets={
+                    "bank": StreamingTransformedBankSource(
+                        source_names=names,
+                        expected_source_shape=(2, 3),
+                        expected_source_dtype="I32",
+                        expected_target_shape=(2, 4, 3),
+                        expected_target_dtype=ir.DataType.INT32,
+                        transform=interleave,
+                    )
+                }
+            )
+
+        report = stream_preprocessed_safetensors_to_model(model, str(tmp_path), planner)
+
+        assert report["largest_reconstruction_working_set_bytes"] == 4 * 24 + 96
+        expected = torch.stack(
+            [
+                torch.stack([sources[f"e{e}.gate"], sources[f"e{e}.up"]], dim=1).reshape(4, 3)
+                for e in range(2)
+            ]
+        )
+        assert torch.equal(torch.from_numpy(target.const_value.numpy()), expected)
+
+    @pytest.mark.parametrize(
+        ("source_shape", "declared_target_shape", "error", "match"),
+        [
+            ((2, 3), (2, 4, 4), ValueError, "declares target shape"),
+            ((3, 2), (2, 4, 3), ValueError, r"has shape \[2, 3\]; expected \[3, 2\]"),
+        ],
+    )
+    def test_transformed_bank_contract_fails_before_binding(
+        self, tmp_path, source_shape, declared_target_shape, error, match
+    ):
+        safetensors.torch.save_file(
+            {f"s{i}": torch.zeros(2, 3, dtype=torch.int32) for i in range(4)},
+            str(tmp_path / "model.safetensors"),
+        )
+        model, target = self._bank_model()
+        transform_calls = []
+
+        def planner(_key_index, _initializers):
+            return StreamingWeightPlan(
+                targets={
+                    "bank": StreamingTransformedBankSource(
+                        source_names=tuple(f"s{i}" for i in range(4)),
+                        expected_source_shape=source_shape,
+                        expected_source_dtype="I32",
+                        expected_target_shape=declared_target_shape,
+                        expected_target_dtype=ir.DataType.INT32,
+                        transform=lambda t: transform_calls.append(True) or t[0],
+                    )
+                }
+            )
+
+        with pytest.raises(error, match=match):
+            stream_preprocessed_safetensors_to_model(model, str(tmp_path), planner)
+        assert target.const_value is None
         assert transform_calls == []
 
     @pytest.mark.skipif(
