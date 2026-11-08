@@ -446,12 +446,19 @@ class MoELayer(nn.Module):
         activation_alpha: float | None = None,
         activation_beta: float | None = None,
         swiglu_limit: float | None = None,
+        fc1_rows_interleaved: bool = False,
     ):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        # QMoE's fc1 parameters arrive in the kernel's interleaved row order
+        # ([g_0, u_0, g_1, u_1, ...]) because the weight loader wrote them that
+        # way, so the graph-side reorder is not emitted. Otherwise ORT folds the
+        # reorder at session load, materialising every expert bank a second time
+        # on the host -- about 11 GB for the 30B Qwen3-Omni thinker at INT4.
+        self._fc1_rows_interleaved = fc1_rows_interleaved
         self._qmoe_quantization = (
             None
             if getattr(config, "disable_qmoe", False)
@@ -553,19 +560,24 @@ class MoELayer(nn.Module):
         if router_weights is not None:
             router_weights = _flatten_to_2d(op, router_weights)
 
-        fc1_experts_weights = _interleave_gate_up_rows(
-            op, self.fc1_experts_weights, self.num_experts, self._fc1_out
-        )
-        fc1_scales = _interleave_gate_up_rows(
-            op, self.fc1_scales, self.num_experts, self._fc1_out
-        )
-        fc1_experts_zero_points = (
-            _interleave_gate_up_rows(
-                op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+        if self._fc1_rows_interleaved:
+            fc1_experts_weights = self.fc1_experts_weights
+            fc1_scales = self.fc1_scales
+            fc1_experts_zero_points = self.fc1_experts_zero_points
+        else:
+            fc1_experts_weights = _interleave_gate_up_rows(
+                op, self.fc1_experts_weights, self.num_experts, self._fc1_out
             )
-            if self.fc1_experts_zero_points is not None
-            else None
-        )
+            fc1_scales = _interleave_gate_up_rows(
+                op, self.fc1_scales, self.num_experts, self._fc1_out
+            )
+            fc1_experts_zero_points = (
+                _interleave_gate_up_rows(
+                    op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+                )
+                if self.fc1_experts_zero_points is not None
+                else None
+            )
         # ``activation_alpha``/``activation_beta``/``swiglu_limit`` are only
         # passed when a caller explicitly set them (e.g. DeepSeek-V4's
         # clipped-SwiGLU expert); omitting them for every other existing
