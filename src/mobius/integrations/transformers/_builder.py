@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import pathlib
 from typing import Any
@@ -23,6 +24,7 @@ from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
     _download_weights,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
     stream_qdq_safetensors_to_model,
 )
@@ -679,6 +681,33 @@ def build_transformers_model(
                 config,
                 revision=revision,
             )
+        elif (
+            config.quantization is not None
+            and config.quantization.quant_method == "compressed-tensors"
+        ):
+            # Weight-only INT4 pack-quantized (llm-compressor W4A16). The model
+            # binds the packed words itself, one component at a time, through a
+            # bounded-memory streaming plan.
+            planner = getattr(model_module, "build_pack_quantized_streaming_plan", None)
+            if planner is None:
+                raise NotImplementedError(
+                    f"{model_type} cannot bind compressed-tensors pack-quantized "
+                    "weights; only models with build_pack_quantized_streaming_plan "
+                    "(Qwen3-Omni) can."
+                )
+            shard_paths = _resolve_shard_paths(model_id, revision)
+            package.weight_loading_report = {
+                "components": {
+                    name: stream_preprocessed_safetensors_to_model(
+                        component_model,
+                        model_id,
+                        functools.partial(planner, name),
+                        revision=revision,
+                        _resolved_paths=shard_paths,
+                    )
+                    for name, component_model in package.items()
+                }
+            }
         elif compressed_tensors_config is not None:
             stream_compressed_tensors_to_package(
                 package,

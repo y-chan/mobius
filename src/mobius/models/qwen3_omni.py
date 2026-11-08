@@ -27,7 +27,9 @@ HuggingFace class: Qwen3OmniMoeThinkerForConditionalGeneration
 
 from __future__ import annotations
 
-from typing import ClassVar
+import re
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, ClassVar
 
 import onnx_ir as ir
 import torch
@@ -39,6 +41,7 @@ from mobius._weight_utils import preprocess_quantized_weights, quantize_linear_i
 from mobius.components import (
     FusedQKVAttention,
     Linear,
+    MoELayer,
     RMSNorm,
     SoftmaxTopKGate,
     TransposedLinear,
@@ -46,7 +49,14 @@ from mobius.components import (
     make_quantized_linear_factory,
 )
 from mobius.components._moe import _realize_gate_and_get_qmoe_routing
-from mobius.models.moe import MoEDecoderLayer, _rename_moe_expert_weights
+from mobius.models.moe import (
+    MoEDecoderLayer,
+    _quantized_linear_class,
+    _rename_moe_expert_weights,
+)
+
+if TYPE_CHECKING:
+    from mobius.integrations._weight_loading import StreamingWeightPlan
 from mobius.models.qwen3_asr import (
     Qwen3ASRAudioEncoder,
     Qwen3ASRDecoderModel,
@@ -61,6 +71,15 @@ _DROPPED_THINKER_PREFIXES = ("visual.",)
 def _is_quantized(config: ArchitectureConfig) -> bool:
     quantization = getattr(config, "quantization", None)
     return quantization is not None and quantization.quant_method != "none"
+
+
+def _is_pack_quantized(config: ArchitectureConfig) -> bool:
+    """Whether the checkpoint is compressed-tensors weight-only ``pack-quantized`` INT4.
+
+    llm-compressor's W4A16 output (GPTQ / AWQ / RTN). Its packed words are
+    bound by :meth:`Qwen3OmniThinkerForConditionalGeneration.build_pack_quantized_streaming_plan`.
+    """
+    return _is_quantized(config) and config.quantization.quant_method == "compressed-tensors"
 
 
 def _float_attention_in_quantized_checkpoint(config: ArchitectureConfig) -> bool:
@@ -403,6 +422,25 @@ class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
         )
 
 
+class Qwen3OmniPackQuantizedDecoderLayer(MoEDecoderLayer):
+    """Decoder layer for compressed-tensors ``pack-quantized`` INT4 checkpoints.
+
+    Attention is four ``MatMulNBits`` projections and the routed experts one
+    QMoE node, as :class:`MoEDecoderLayer` builds them for any quantized
+    checkpoint. The difference is QMoE's fc1: the streaming plan writes its
+    rows already gate/up-interleaved, so the graph does not reorder them.
+    """
+
+    def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
+        super().__init__(config, gate=gate, **kwargs)
+        self.mlp = MoELayer(
+            config,
+            gate=gate,
+            linear_class=_quantized_linear_class(config),
+            fc1_rows_interleaved=True,
+        )
+
+
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
     """Qwen3-Omni thinker text decoder: inputs_embeds → logits + KV cache.
 
@@ -424,6 +462,18 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
         self._dtype = config.dtype
         if _use_fused_moe(config):
             layer_class = Qwen3OmniDecoderLayer
+        elif _is_pack_quantized(config):
+            if _float_attention_in_quantized_checkpoint(config):
+                raise NotImplementedError(
+                    "Qwen3-Omni compressed-tensors checkpoints are supported with "
+                    "quantized attention only; this one leaves attention in float."
+                )
+            if config.export_attn_weight_bits is not None:
+                raise ValueError(
+                    "export_attn_weight_bits cannot be used with a compressed-tensors "
+                    "checkpoint: its attention projections are already INT4."
+                )
+            layer_class = Qwen3OmniPackQuantizedDecoderLayer
         elif _is_quantized(config) and _float_attention_in_quantized_checkpoint(config):
             layer_class = Qwen3OmniQuantizedExpertsDecoderLayer
         else:
@@ -498,6 +548,212 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
             past_key_values=past_key_values,
         )
 
+    def build_pack_quantized_streaming_plan(
+        self,
+        component: str,
+        key_index: Mapping[str, tuple[str, list[int], str]],
+        initializers: Mapping[str, ir.Value],
+    ) -> StreamingWeightPlan:
+        """Bind a compressed-tensors ``pack-quantized`` INT4 checkpoint to one component.
+
+        The attention projections' ``weight_packed`` words become ``MatMulNBits``
+        blobs and each layer's per-expert projections become QMoE banks, by
+        reinterpreting the packed bytes
+        (:func:`~mobius.integrations.compressed_tensors.packed_weight_bytes`),
+        never by requantizing; fc1 rows are written gate/up-interleaved, the
+        order QMoE reads. Everything else is copied and cast to the export
+        dtype, and ``--features lm-head-int8`` quantizes the float LM head as the
+        float path does. Tensors are read only when the external data is
+        written, so host memory holds one expert bank (~0.4 GB for the 30B
+        thinker) rather than the 20 GB checkpoint.
+
+        Every checkpoint key is classified: this component's tensors are
+        targets; other components', the talker's, code2wav's and the vision
+        tower's are ignored with the reason; ``weight_shape`` sidecars are
+        ignored because the packed and scale shapes checked here determine
+        them. A key that fits none of these is left unclassified, which the
+        streaming loader rejects.
+        """
+        from onnx_ir import tensor_adapters
+
+        from mobius.integrations._weight_loading import (
+            StreamingTransformedBankSource,
+            StreamingTransformedWeightSource,
+            StreamingWeightPlan,
+            StreamingWeightSource,
+        )
+        from mobius.integrations.compressed_tensors import packed_weight_bytes
+
+        config = self.config
+        if not _is_pack_quantized(config):
+            raise ValueError(
+                "build_pack_quantized_streaming_plan needs a pack-quantized config"
+            )
+        group = config.quantization.group_size
+        num_experts = config.num_local_experts
+        assert num_experts is not None
+        prefix = "thinker." if any(key.startswith("thinker.") for key in key_index) else ""
+        targets: dict[str, object] = {}
+        bound: set[str] = set()
+
+        def source(name: str) -> str:
+            full = prefix + name
+            if full not in key_index:
+                raise ValueError(f"Checkpoint has no '{full}' for the {component} component")
+            bound.add(full)
+            return full
+
+        def packed_projection(module: str, init: ir.Value) -> StreamingTransformedWeightSource:
+            rows, n_blocks, blob = (int(d) for d in init.shape)
+            cols = n_blocks * group
+            return StreamingTransformedWeightSource(
+                source_name=source(f"{module}.weight_packed"),
+                expected_source_shape=(rows, cols // 8),
+                expected_source_dtype="I32",
+                expected_target_shape=(rows, n_blocks, blob),
+                expected_target_dtype=ir.DataType.UINT8,
+                transform=lambda t, _n, shape=(rows, n_blocks, blob): packed_weight_bytes(
+                    t
+                ).reshape(shape),
+            )
+
+        def expert_bank(
+            layer: str, kind: str, init: ir.Value
+        ) -> StreamingTransformedBankSource:
+            experts = f"model.layers.{layer}.mlp.experts"
+            target_shape = tuple(int(d) for d in init.shape)
+            fc1 = kind.startswith("fc1")
+            suffix = "weight_packed" if kind.endswith("weights") else "weight_scale"
+            projections = ("gate_proj", "up_proj") if fc1 else ("down_proj",)
+            names = tuple(
+                source(f"{experts}.{e}.{p}.{suffix}")
+                for e in range(num_experts)
+                for p in projections
+            )
+            rows = target_shape[1] // len(projections)
+            if suffix == "weight_packed":
+                source_shape = (rows, target_shape[2] // 4)
+                source_dtype = "I32"
+                convert = packed_weight_bytes
+            else:
+                source_shape = (rows, target_shape[2])
+                source_dtype = key_index[names[0]][2]
+                scale_dtype = tensor_adapters.to_torch_dtype(init.dtype)
+                convert = lambda t: t.to(scale_dtype)  # noqa: E731
+
+            def transform(
+                tensors: list[torch.Tensor], n: int = len(projections)
+            ) -> torch.Tensor:
+                per_expert = [
+                    # [rows, n, cols] -> [n * rows, cols]: rows g_0, u_0, g_1, u_1, ...
+                    torch.stack(
+                        [convert(t) for t in tensors[e * n : (e + 1) * n]], dim=1
+                    ).reshape(-1, target_shape[2])
+                    for e in range(num_experts)
+                ]
+                return torch.stack(per_expert)
+
+            return StreamingTransformedBankSource(
+                source_names=names,
+                expected_source_shape=source_shape,
+                expected_source_dtype=source_dtype,
+                expected_target_shape=target_shape,
+                expected_target_dtype=init.dtype,
+                transform=transform,
+            )
+
+        def int8_head(part: str, init: ir.Value) -> StreamingTransformedWeightSource:
+            name = source("lm_head.weight")
+            block = config.export_weight_quant_block_size
+            index = 0 if part == "weight" else 1
+            out_dtype = tensor_adapters.to_torch_dtype(init.dtype)
+
+            def transform(t: torch.Tensor, _n: str) -> torch.Tensor:
+                quantized = quantize_linear_int8_blocks(t.to(torch.float32), block_size=block)
+                return quantized[index].to(out_dtype)
+
+            return StreamingTransformedWeightSource(
+                source_name=name,
+                expected_source_shape=tuple(key_index[name][1]),
+                expected_source_dtype=key_index[name][2],
+                expected_target_shape=tuple(int(d) for d in init.shape),
+                expected_target_dtype=init.dtype,
+                transform=transform,
+            )
+
+        for name, init in initializers.items():
+            if init.const_value is not None:
+                continue
+            if name.startswith("audio_tower."):
+                targets[name] = StreamingWeightSource(source(name))
+            elif name == "embedding.embed_tokens.weight":
+                targets[name] = StreamingWeightSource(source("model.embed_tokens.weight"))
+            elif name == "decoder.norm.weight":
+                targets[name] = StreamingWeightSource(source("model.norm.weight"))
+            elif name in ("decoder.lm_head.weight", "decoder.lm_head.scales"):
+                if config.export_lm_head_weight_bits is None:
+                    targets[name] = StreamingWeightSource(source("lm_head.weight"))
+                else:
+                    targets[name] = int8_head(name.rsplit(".", 1)[1], init)
+            elif match := re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name):
+                layer, rest = match.groups()
+                module = f"model.layers.{layer}"
+                if proj := re.fullmatch(r"self_attn\.([qkvo]_proj)\.(weight|scales)", rest):
+                    attn = f"{module}.self_attn.{proj.group(1)}"
+                    if proj.group(2) == "weight":
+                        targets[name] = packed_projection(attn, init)
+                    else:
+                        targets[name] = StreamingWeightSource(source(f"{attn}.weight_scale"))
+                elif rest.startswith("mlp.fc"):
+                    targets[name] = expert_bank(layer, rest.removeprefix("mlp."), init)
+                else:
+                    targets[name] = StreamingWeightSource(source(f"{module}.{rest}"))
+            else:
+                raise ValueError(
+                    f"No compressed-tensors source rule for '{name}' ({component})"
+                )
+
+        owners = (
+            ("audio_tower.", "audio_encoder"),
+            ("model.embed_tokens.", "embedding"),
+            ("model.layers.", "decoder"),
+            ("model.norm.", "decoder"),
+            ("lm_head.", "decoder"),
+        )
+        computed = {
+            name for name, init in initializers.items() if init.const_value is not None
+        }
+        ignored: dict[str, str] = {}
+        for key in key_index:
+            if key in bound:
+                continue
+            if key.startswith(_DROPPED_PREFIXES):
+                ignored[key] = "outside the thinker (talker / code2wav)"
+                continue
+            inner = key.removeprefix(prefix)
+            if inner.startswith(_DROPPED_THINKER_PREFIXES):
+                ignored[key] = "vision tower is not exported"
+            elif inner in computed:
+                ignored[key] = "computed in the graph (e.g. the sinusoidal position table)"
+            elif inner.endswith(".weight_shape"):
+                ignored[key] = "logical shape; implied by the checked packed and scale shapes"
+            else:
+                owner = next((c for p, c in owners if inner.startswith(p)), None)
+                if owner is not None and owner != component:
+                    ignored[key] = f"bound by the {owner} component"
+        return StreamingWeightPlan(
+            targets=targets,
+            ignored=ignored,
+            report={
+                "source_quantization": f"compressed-tensors pack-quantized int4 group {group}",
+                "output_weight_format": (
+                    "int4 MatMulNBits/QMoE, packed bytes reinterpreted"
+                    if component == "decoder"
+                    else "dense"
+                ),
+            },
+        )
+
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
@@ -515,6 +771,12 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
           quantized here when ``export_attn_weight_bits`` asks for it)
         - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
         """
+        if _is_pack_quantized(self.config):
+            raise NotImplementedError(
+                "compressed-tensors pack-quantized checkpoints are bound by "
+                "build_pack_quantized_streaming_plan (the transformers builder "
+                "streams them); preprocess_weights does not load them."
+            )
         thinker_state: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(_DROPPED_PREFIXES):

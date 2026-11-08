@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
+import json
 
 import numpy as np
 import onnx_ir as ir
 import pytest
+import safetensors.torch
 import torch
 
 from mobius._build_context import build_context
@@ -19,6 +22,7 @@ from mobius._configs import ArchitectureConfig
 from mobius._execution_providers import EpCapabilities
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._weight_utils import quantize_linear_int8_blocks
+from mobius.integrations._weight_loading import stream_preprocessed_safetensors_to_model
 from mobius.integrations.transformers._builder import _select_primary_config
 from mobius.models.qwen3_omni import Qwen3OmniThinkerForConditionalGeneration
 from mobius.tasks import SpeechLanguageTask
@@ -356,6 +360,236 @@ def test_partially_float_attention_is_rejected():
     config = ArchitectureConfig.from_transformers(primary, parent_config=parent)
     with pytest.raises(ValueError, match="every layer"):
         Qwen3OmniThinkerForConditionalGeneration(config)
+
+
+# ---------------------------------------------------------------------------
+# compressed-tensors pack-quantized INT4 checkpoints (llm-compressor W4A16)
+# ---------------------------------------------------------------------------
+
+_INT4_GROUP = 32
+
+
+def _quantize_int4_group(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric int4 in [-8, 7] with one fp32 scale per ``_INT4_GROUP`` inputs."""
+    rows, cols = weight.shape
+    groups = weight.detach().float().reshape(rows, cols // _INT4_GROUP, _INT4_GROUP)
+    scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-30) / 7.0
+    q = torch.round(groups / scale).clamp_(-8, 7).to(torch.int8).reshape(rows, cols)
+    return q, scale.reshape(rows, -1)
+
+
+def _pack_int4(q: torch.Tensor) -> torch.Tensor:
+    """compressed-tensors ``pack_to_int32``: eight values per word, low bits first, +8."""
+    unsigned = (q.to(torch.int64) + 8).reshape(q.shape[0], -1, 8)
+    words = (unsigned << (torch.arange(8, dtype=torch.int64) * 4)).sum(-1)
+    return torch.from_numpy(words.numpy().astype(np.uint32).view(np.int32))
+
+
+def _dequantize_int4_group(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return (q.float().reshape(*scale.shape, _INT4_GROUP) * scale.unsqueeze(-1)).reshape(
+        q.shape
+    )
+
+
+def _pack_quantized_checkpoint(hf_model) -> dict[str, torch.Tensor]:
+    """compressed-tensors W4A16 state dict; the HF model gets the dequantized weights.
+
+    Attention and per-expert projections are packed the way llm-compressor
+    writes them (``weight_packed`` / ``weight_scale`` / ``weight_shape``);
+    everything else stays float, as the ``ignore`` list leaves the router,
+    norms, embeddings and LM head. Mutating the HF model to the dequantized
+    values makes it the exact reference for the export.
+    """
+    state_dict: dict[str, torch.Tensor] = {}
+
+    def pack(prefix: str, weight: torch.Tensor) -> torch.Tensor:
+        q, scale = _quantize_int4_group(weight)
+        state_dict[f"{prefix}.weight_packed"] = _pack_int4(q)
+        state_dict[f"{prefix}.weight_scale"] = scale
+        state_dict[f"{prefix}.weight_shape"] = torch.tensor(list(weight.shape))
+        return _dequantize_int4_group(q, scale)
+
+    packed_float_keys = set()
+    with torch.no_grad():
+        for i, layer in enumerate(hf_model.model.layers):
+            base = f"thinker.model.layers.{i}"
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                proj = getattr(layer.self_attn, name)
+                proj.weight.copy_(pack(f"{base}.self_attn.{name}", proj.weight))
+                packed_float_keys.add(f"model.layers.{i}.self_attn.{name}.weight")
+            experts = layer.mlp.experts
+            inter = experts.down_proj.shape[2]
+            for e in range(experts.gate_up_proj.shape[0]):
+                # HF fuses [gate; up] rows; checkpoints store them per expert.
+                gate_up = experts.gate_up_proj[e]
+                experts_base = f"{base}.mlp.experts.{e}"
+                gate_up[:inter].copy_(pack(f"{experts_base}.gate_proj", gate_up[:inter]))
+                gate_up[inter:].copy_(pack(f"{experts_base}.up_proj", gate_up[inter:]))
+                experts.down_proj[e].copy_(
+                    pack(f"{experts_base}.down_proj", experts.down_proj[e])
+                )
+        for key, value in hf_model.state_dict().items():
+            if key in packed_float_keys or ".mlp.experts." in key:
+                continue
+            state_dict[f"thinker.{key}"] = value.detach().clone()
+    # Released checkpoints hold the full Omni model; the talker is not exported.
+    state_dict["talker.model.norm.weight"] = torch.ones(8)
+    return state_dict
+
+
+def _pack_quantized_config(num_layers: int) -> dict:
+    """The quantization_config llm-compressor writes for W4A16."""
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "quantization_status": "compressed",
+        "version": "0.11.0",
+        "config_groups": {
+            "group_0": {
+                "format": "pack-quantized",
+                "targets": ["Linear"],
+                "input_activations": None,
+                "output_activations": None,
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "strategy": "group",
+                    "group_size": _INT4_GROUP,
+                    "symmetric": True,
+                    "dynamic": False,
+                    "actorder": None,
+                },
+            }
+        },
+        "ignore": [
+            "thinker.lm_head",
+            *(f"thinker.model.layers.{i}.mlp.gate" for i in range(num_layers)),
+        ],
+        "kv_cache_scheme": None,
+        "sparsity_config": {},
+        "transform_config": {},
+    }
+
+
+def _stream_into(package, module, checkpoint) -> None:
+    for name, model in package.items():
+        stream_preprocessed_safetensors_to_model(
+            model,
+            str(checkpoint),
+            functools.partial(module.build_pack_quantized_streaming_plan, name),
+        )
+
+
+@pytest.fixture(scope="module")
+def omni_int4(tmp_path_factory):
+    hf_config, hf_model = _tiny_hf_model()
+    state_dict = _pack_quantized_checkpoint(hf_model)
+    num_layers = hf_config.thinker_config.text_config.num_hidden_layers
+    hf_config.quantization_config = _pack_quantized_config(num_layers)
+    primary, parent, _ = _select_primary_config(hf_config)
+    config = ArchitectureConfig.from_transformers(primary, parent_config=parent)
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=SpeechLanguageTask())
+    checkpoint = tmp_path_factory.mktemp("omni_int4")
+    safetensors.torch.save_file(state_dict, str(checkpoint / "model.safetensors"))
+    _stream_into(package, module, checkpoint)
+    return config, hf_model, package, checkpoint
+
+
+def test_int4_checkpoint_builds_matmulnbits_and_prepacked_qmoe(omni_int4):
+    config, _, package, _ = omni_int4
+    assert config.quantization.quant_method == "compressed-tensors"
+    graph = package["decoder"].graph
+    qmoe = [n for n in graph.all_nodes() if n.op_type == "QMoE"]
+    assert len(qmoe) == config.num_hidden_layers
+    for node in qmoe:
+        assert node.attributes["expert_weight_bits"].as_int() == 4
+        assert node.attributes["block_size"].as_int() == _INT4_GROUP
+        # fc1 weights and scales are initializers, not a Reshape/Transpose of
+        # one: the loader already wrote the rows gate/up-interleaved.
+        for fc1 in node.inputs[2:4]:
+            assert fc1.producer() is None
+            assert fc1.name in graph.initializers
+    nbits = [n for n in graph.all_nodes() if n.op_type == "MatMulNBits"]
+    assert len(nbits) == 4 * config.num_hidden_layers
+    assert {n.attributes["bits"].as_int() for n in nbits} == {4}
+    report = json.loads(package["decoder"].metadata_props["mobius.weight_loading"])
+    assert report["output_weight_format"].startswith("int4")
+
+
+def test_int4_checkpoint_matches_dequantized_hf(omni_int4):
+    config, hf_model, package, _ = omni_int4
+    rng = np.random.default_rng(2)
+    mel_len = 200
+    input_features = rng.standard_normal((1, _NUM_MEL_BINS, mel_len)).astype(np.float32)
+    feature_attention_mask = np.ones((1, mel_len), dtype=np.int64)
+    audio_out = _run(
+        package["audio_encoder"],
+        {"input_features": input_features, "feature_attention_mask": feature_attention_mask},
+    )
+    num_audio_tokens = int(audio_out["audio_feature_lengths"][0])
+    audio_features = audio_out["audio_features"][0, :num_audio_tokens]
+    input_ids = np.array(
+        [[1, 2, *([_AUDIO_TOKEN_ID] * num_audio_tokens), 3, 4]], dtype=np.int64
+    )
+    inputs_embeds = _run(
+        package["embedding"], {"input_ids": input_ids, "audio_features": audio_features}
+    )["inputs_embeds"]
+    seq_len = input_ids.shape[1]
+    attention_mask = np.ones_like(input_ids)
+    pos = np.arange(seq_len, dtype=np.int64)
+    position_ids = np.stack([pos, pos, pos])[:, None, :]
+
+    with torch.no_grad():
+        hf_logits = hf_model(
+            input_ids=torch.from_numpy(input_ids),
+            input_features=torch.from_numpy(input_features),
+            feature_attention_mask=torch.from_numpy(feature_attention_mask),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+            use_cache=False,
+        ).logits.numpy()
+
+    kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
+    decoder_out = _run(
+        package["decoder"],
+        {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            **{
+                f"past_key_values.{i}.{kind}": np.zeros(kv_shape, dtype=np.float32)
+                for i in range(config.num_hidden_layers)
+                for kind in ("key", "value")
+            },
+        },
+    )
+    # The packed bytes are bound, not requantized, so only accumulation order
+    # separates the two; a gate/up row swap or a nibble-order slip is ~1e-2.
+    np.testing.assert_allclose(decoder_out["logits"], hf_logits, rtol=1e-5, atol=1e-5)
+
+
+def test_int4_unexpected_checkpoint_tensor_is_rejected(omni_int4, tmp_path):
+    config, _, _, checkpoint = omni_int4
+    state = safetensors.torch.load_file(str(checkpoint / "model.safetensors"))
+    # A zero point the plan has no rule for: asymmetric data must not load silently.
+    state["thinker.model.layers.0.self_attn.q_proj.weight_zero_point"] = torch.zeros(4)
+    safetensors.torch.save_file(state, str(tmp_path / "model.safetensors"))
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=SpeechLanguageTask())
+    with pytest.raises(ValueError, match="unclassified"):
+        stream_preprocessed_safetensors_to_model(
+            package["decoder"],
+            str(tmp_path),
+            functools.partial(module.build_pack_quantized_streaming_plan, "decoder"),
+        )
+
+
+def test_int4_checkpoint_is_not_loaded_eagerly(omni_int4):
+    config, *_ = omni_int4
+    module = Qwen3OmniThinkerForConditionalGeneration(config)
+    with pytest.raises(NotImplementedError, match="build_pack_quantized_streaming_plan"):
+        module.preprocess_weights({})
 
 
 # ---------------------------------------------------------------------------
