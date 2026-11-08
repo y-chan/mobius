@@ -366,9 +366,21 @@ comparison (bf16 activations, Marlin kernels, `LLM.generate`).
 At 45 s of audio the prefill is 11 ms of mel features, 29 ms of audio
 encoder, 1 ms of embedding and 123 ms of decoder.
 
+The table is the export with three Q/K/V projections. Joining them into one
+`MatMulNBits` (now the default for quantized attention) takes decode to 181
+tokens/s on ORT 1.29 with the prefill unchanged. Per layer the INT4 Q/K/V
+GEMVs go from 17.0 to 10.5 us: the two `N = 512` calls ran at 150-220 GB/s
+against 510-630 GB/s for the large ones, so a fixed per-call cost, not the
+bytes, was what they spent.
+
 The decode embedding's host round trip -- the embedding session's `Run` plus
 the 4 KB copy into the captured graph's input -- costs 0.13 ms per step on
-this host, 2% of a step, against 0.06 ms on Blackwell.
+this host, 2% of a step, against 0.06 ms on Blackwell. Binding the embedding
+output straight into the decoder's input buffer instead (same or separate
+CUDA streams, with or without the per-`Run` synchronization) produced the same
+greedy tokens on three clips here and recovered only 1%: the cost is the
+second session `Run`, not the copy. A decoder that looks the token up itself
+inside the captured graph decoded 7% faster in a hand-edited export.
 
 The greedy transcripts agree with vLLM's in content but not always in
 formatting. With timestamps and speaker labels removed and numerals
