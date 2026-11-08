@@ -36,7 +36,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizedWeightFormat
 from mobius._weight_utils import preprocess_quantized_weights, quantize_linear_int8_blocks
 from mobius.components import (
     FusedQKVAttention,
@@ -133,16 +133,43 @@ def _use_fused_moe(config: ArchitectureConfig) -> bool:
     return ep_capabilities().supports_fused_moe
 
 
+def _packs_quantized_qkv(config: ArchitectureConfig) -> bool:
+    """Whether checkpoint-quantized attention joins Q/K/V into one ``MatMulNBits``.
+
+    ``MatMulNBits`` weights, scales and zero points are all row-major in the
+    output features, so three projections join by concatenating rows -- exact,
+    nothing requantized -- when they share one integer-affine scheme: the
+    model-wide bits, block and zero-point setting with no per-module override.
+    That is the case for GPTQ / AWQ / Olive / compressed-tensors checkpoints of
+    at most 8 bits.
+
+    One ``N = 5120`` GEMV instead of 4096 + 512 + 512 removes the two small calls,
+    which cost the most per byte. On an RTX 3090 at decode, the INT4 Q/K/V of a
+    layer go from 17.0 to 10.5 us (13.6 to 8.9 with a wide M=1 kernel), INT8
+    from 26.5 to 16.7 us.
+    """
+    quantization = getattr(config, "quantization", None)
+    return (
+        _is_quantized(config)
+        and not _float_attention_in_quantized_checkpoint(config)
+        and quantization.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+        and quantization.bits <= 8
+        and not quantization.float_zero_point
+        and not quantization.overrides
+    )
+
+
 def _use_fused_qkv(config: ArchitectureConfig) -> bool:
     """Whether the decoder layers take one packed Q/K/V projection.
 
-    Only the two Qwen3-Omni layer classes below do, and both keep attention in
-    float. The generic :class:`~mobius.models.moe.MoEDecoderLayer` fallback
-    quantizes the projections, where packing would mean joining block-quantized
-    weights rather than plain matrices.
+    Float attention joins the checkpoint's matrices (fused-MoE or expert-only
+    quantized checkpoints); quantized attention joins its integer blocks after
+    conversion (:func:`_packs_quantized_qkv`). Only the generic
+    :class:`~mobius.models.moe.MoEDecoderLayer` fallback keeps three projections.
     """
     return _use_fused_moe(config) or (
-        _is_quantized(config) and _float_attention_in_quantized_checkpoint(config)
+        _is_quantized(config)
+        and (_float_attention_in_quantized_checkpoint(config) or _packs_quantized_qkv(config))
     )
 
 
@@ -240,7 +267,9 @@ def _quantize_attention_projections(
     return state_dict
 
 
-def _pack_qkv_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _pack_qkv_weights(
+    state_dict: dict[str, torch.Tensor], layers_prefix: str = "model.layers."
+) -> dict[str, torch.Tensor]:
     """Join each decoder layer's separate Q/K/V projections into one tensor.
 
     :class:`~mobius.components.FusedQKVAttention` reads ``[Q | K | V]`` rows
@@ -248,12 +277,16 @@ def _pack_qkv_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Te
     Joining them here turns three ``MatMul`` nodes per layer into one, which on
     the 48-layer thinker is 96 fewer nodes in every decode step.
 
-    Only ``model.layers.*`` is touched. The audio tower has its own attention
-    with separate projections and must keep them.
+    Every tensor of a projection is joined along dim 0: float weights before
+    mapping (``model.layers.*``), and ``MatMulNBits`` weights / scales / zero
+    points -- all rows of output features -- after quantized conversion
+    (``layers_prefix="decoder.layers."``). Raw GPTQ / AWQ tensors put the
+    output features last and must not be joined here. Only decoder layers are
+    touched: the audio tower has its own attention and keeps three projections.
     """
     packed: dict[str, torch.Tensor] = {}
     for key in list(state_dict):
-        if not key.startswith("model.layers."):
+        if not key.startswith(layers_prefix):
             continue
         prefix, separator, suffix = key.partition(".self_attn.q_proj.")
         if not separator:
@@ -422,23 +455,41 @@ class Qwen3OmniQuantizedExpertsDecoderLayer(MoEDecoderLayer):
         )
 
 
-class Qwen3OmniPackQuantizedDecoderLayer(MoEDecoderLayer):
+class Qwen3OmniQuantizedDecoderLayer(MoEDecoderLayer):
+    """Decoder layer for checkpoints that quantize attention as well as the experts.
+
+    The projections keep the checkpoint's integer blocks and the routed experts
+    are one QMoE node, as :class:`MoEDecoderLayer` builds them, but Q/K/V are
+    one ``MatMulNBits`` (:func:`_packs_quantized_qkv`) and the output projection
+    another. ``fc1_rows_interleaved`` is for loaders that write QMoE's fc1 rows
+    already gate/up-interleaved, so the graph does not reorder them.
+    """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module,
+        *,
+        fc1_rows_interleaved: bool = False,
+        **kwargs,
+    ):
+        super().__init__(config, gate=gate, **kwargs)
+        linear_class = _quantized_linear_class(config)
+        self.self_attn = FusedQKVAttention(config, linear_class=linear_class)
+        if fc1_rows_interleaved:
+            self.mlp = MoELayer(
+                config, gate=gate, linear_class=linear_class, fc1_rows_interleaved=True
+            )
+
+
+class Qwen3OmniPackQuantizedDecoderLayer(Qwen3OmniQuantizedDecoderLayer):
     """Decoder layer for compressed-tensors ``pack-quantized`` INT4 checkpoints.
 
-    Attention is four ``MatMulNBits`` projections and the routed experts one
-    QMoE node, as :class:`MoEDecoderLayer` builds them for any quantized
-    checkpoint. The difference is QMoE's fc1: the streaming plan writes its
-    rows already gate/up-interleaved, so the graph does not reorder them.
+    Its streaming plan joins Q/K/V and interleaves QMoE's fc1 rows as it writes them.
     """
 
     def __init__(self, config: ArchitectureConfig, gate: nn.Module, **kwargs):
-        super().__init__(config, gate=gate, **kwargs)
-        self.mlp = MoELayer(
-            config,
-            gate=gate,
-            linear_class=_quantized_linear_class(config),
-            fc1_rows_interleaved=True,
-        )
+        super().__init__(config, gate=gate, fc1_rows_interleaved=True, **kwargs)
 
 
 class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
@@ -476,6 +527,8 @@ class Qwen3OmniThinkerDecoderModel(Qwen3ASRDecoderModel):
             layer_class = Qwen3OmniPackQuantizedDecoderLayer
         elif _is_quantized(config) and _float_attention_in_quantized_checkpoint(config):
             layer_class = Qwen3OmniQuantizedExpertsDecoderLayer
+        elif _packs_quantized_qkv(config):
+            layer_class = Qwen3OmniQuantizedDecoderLayer
         else:
             layer_class = MoEDecoderLayer
         self.layers = nn.ModuleList(
@@ -557,7 +610,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
         """Bind a compressed-tensors ``pack-quantized`` INT4 checkpoint to one component.
 
         The attention projections' ``weight_packed`` words become ``MatMulNBits``
-        blobs and each layer's per-expert projections become QMoE banks, by
+        blobs (Q/K/V joined into one) and each layer's per-expert projections
+        become QMoE banks, by
         reinterpreting the packed bytes
         (:func:`~mobius.integrations.compressed_tensors.packed_weight_bytes`),
         never by requantizing; fc1 rows are written gate/up-interleaved, the
@@ -603,18 +657,47 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
             bound.add(full)
             return full
 
-        def packed_projection(module: str, init: ir.Value) -> StreamingTransformedWeightSource:
-            rows, n_blocks, blob = (int(d) for d in init.shape)
-            cols = n_blocks * group
-            return StreamingTransformedWeightSource(
-                source_name=source(f"{module}.weight_packed"),
-                expected_source_shape=(rows, cols // 8),
-                expected_source_dtype="I32",
-                expected_target_shape=(rows, n_blocks, blob),
-                expected_target_dtype=ir.DataType.UINT8,
-                transform=lambda t, _n, shape=(rows, n_blocks, blob): packed_weight_bytes(
-                    t
-                ).reshape(shape),
+        def projection(
+            modules: tuple[str, ...], part: str, init: ir.Value
+        ) -> StreamingTransformedBankSource:
+            """One MatMulNBits weight or scale tensor from one or more projections' rows.
+
+            Q/K/V join along the output rows (``FusedQKVAttention``), which is
+            exact for both the packed words and their per-row scales.
+            """
+            suffix = "weight_packed" if part == "weight" else "weight_scale"
+            names = tuple(source(f"{m}.{suffix}") for m in modules)
+            target_shape = tuple(int(d) for d in init.shape)
+            cols = target_shape[1] * group  # n_blocks * group
+            row_counts = [key_index[n][1][0] for n in names]
+            if sum(row_counts) != target_shape[0]:
+                raise ValueError(
+                    f"{', '.join(names)} hold {sum(row_counts)} rows; the graph's "
+                    f"{init.name} has {target_shape[0]}"
+                )
+            if part == "weight":
+                shapes = tuple((rows, cols // 8) for rows in row_counts)
+                dtype = "I32"
+
+                def transform(tensors: list[torch.Tensor]) -> torch.Tensor:
+                    return torch.cat([packed_weight_bytes(t) for t in tensors]).reshape(
+                        target_shape
+                    )
+            else:
+                shapes = tuple((rows, target_shape[1]) for rows in row_counts)
+                dtype = key_index[names[0]][2]
+                scale_dtype = tensor_adapters.to_torch_dtype(init.dtype)
+
+                def transform(tensors: list[torch.Tensor]) -> torch.Tensor:
+                    return torch.cat(tensors).to(scale_dtype)
+
+            return StreamingTransformedBankSource(
+                source_names=names,
+                expected_source_shapes=shapes,
+                expected_source_dtype=dtype,
+                expected_target_shape=target_shape,
+                expected_target_dtype=init.dtype,
+                transform=transform,
             )
 
         def expert_bank(
@@ -655,7 +738,7 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
 
             return StreamingTransformedBankSource(
                 source_names=names,
-                expected_source_shape=source_shape,
+                expected_source_shapes=(source_shape,) * len(names),
                 expected_source_dtype=source_dtype,
                 expected_target_shape=target_shape,
                 expected_target_dtype=init.dtype,
@@ -698,12 +781,16 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
             elif match := re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name):
                 layer, rest = match.groups()
                 module = f"model.layers.{layer}"
-                if proj := re.fullmatch(r"self_attn\.([qkvo]_proj)\.(weight|scales)", rest):
-                    attn = f"{module}.self_attn.{proj.group(1)}"
-                    if proj.group(2) == "weight":
-                        targets[name] = packed_projection(attn, init)
-                    else:
-                        targets[name] = StreamingWeightSource(source(f"{attn}.weight_scale"))
+                if proj := re.fullmatch(
+                    r"self_attn\.(qkv_proj|o_proj)\.(weight|scales)", rest
+                ):
+                    attn = f"{module}.self_attn"
+                    modules = (
+                        (f"{attn}.q_proj", f"{attn}.k_proj", f"{attn}.v_proj")
+                        if proj.group(1) == "qkv_proj"
+                        else (f"{attn}.o_proj",)
+                    )
+                    targets[name] = projection(modules, proj.group(2), init)
                 elif rest.startswith("mlp.fc"):
                     targets[name] = expert_bank(layer, rest.removeprefix("mlp."), init)
                 else:
@@ -786,7 +873,10 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
                 continue
             thinker_state[key] = value
         quantized = _is_quantized(self.config)
-        if _use_fused_qkv(self.config):
+        # Quantized Q/K/V are joined after conversion, once every format is in
+        # MatMulNBits' row-major [N, ...] layout (see the end of this method).
+        quantized_qkv = _packs_quantized_qkv(self.config)
+        if _use_fused_qkv(self.config) and not quantized_qkv:
             thinker_state = _pack_qkv_weights(thinker_state)
         if self._fused_moe:
             thinker_state = _stack_expert_weights(thinker_state)
@@ -832,6 +922,8 @@ class Qwen3OmniThinkerForConditionalGeneration(nn.Module):
                 elif lm_key in cleaned and embed_key not in cleaned:
                     cleaned[embed_key] = cleaned[lm_key]
             result = cleaned
+        if quantized_qkv:
+            result = _pack_qkv_weights(result, layers_prefix="decoder.layers.")
 
         # Last, so the checkpoint's own quantized tensors are already in their
         # final names and nothing here is mistaken for one of them.

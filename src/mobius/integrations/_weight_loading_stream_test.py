@@ -383,7 +383,7 @@ class TestStreamingRefusals:
                 targets={
                     "bank": StreamingTransformedBankSource(
                         source_names=names,
-                        expected_source_shape=(2, 3),
+                        expected_source_shapes=((2, 3),) * 4,
                         expected_source_dtype="I32",
                         expected_target_shape=(2, 4, 3),
                         expected_target_dtype=ir.DataType.INT32,
@@ -402,6 +402,47 @@ class TestStreamingRefusals:
             ]
         )
         assert torch.equal(torch.from_numpy(target.const_value.numpy()), expected)
+
+    def test_transformed_bank_joins_differently_shaped_sources(self, tmp_path):
+        # Q/K/V style: row counts differ, the target is their concatenation.
+        sources = {
+            "q": torch.arange(12, dtype=torch.int32).reshape(4, 3),
+            "k": torch.arange(3, dtype=torch.int32).reshape(1, 3) + 100,
+            "v": torch.arange(9, dtype=torch.int32).reshape(3, 3) + 200,
+        }
+        safetensors.torch.save_file(sources, str(tmp_path / "model.safetensors"))
+        target = ir.Value(
+            name="qkv",
+            type=ir.TensorType(ir.DataType.INT32),
+            shape=ir.Shape([8, 3]),
+            const_value=ir.tensor(torch.zeros(8, 3, dtype=torch.int32)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="qkv")
+        graph.register_initializer(target)
+        target.const_value = None
+        model = ir.Model(graph, ir_version=12)
+
+        def planner(_key_index, _initializers):
+            return StreamingWeightPlan(
+                targets={
+                    "qkv": StreamingTransformedBankSource(
+                        source_names=("q", "k", "v"),
+                        expected_source_shapes=((4, 3), (1, 3), (3, 3)),
+                        expected_source_dtype="I32",
+                        expected_target_shape=(8, 3),
+                        expected_target_dtype=ir.DataType.INT32,
+                        transform=lambda tensors: torch.cat(tensors),
+                    )
+                }
+            )
+
+        report = stream_preprocessed_safetensors_to_model(model, str(tmp_path), planner)
+
+        assert report["largest_source_tensor_bytes"] == 48
+        assert report["largest_reconstruction_working_set_bytes"] == 96 + 96
+        assert torch.equal(
+            torch.from_numpy(target.const_value.numpy()), torch.cat(list(sources.values()))
+        )
 
     @pytest.mark.parametrize(
         ("source_shape", "declared_target_shape", "error", "match"),
@@ -425,7 +466,7 @@ class TestStreamingRefusals:
                 targets={
                     "bank": StreamingTransformedBankSource(
                         source_names=tuple(f"s{i}" for i in range(4)),
-                        expected_source_shape=source_shape,
+                        expected_source_shapes=(source_shape,) * 4,
                         expected_source_dtype="I32",
                         expected_target_shape=declared_target_shape,
                         expected_target_dtype=ir.DataType.INT32,

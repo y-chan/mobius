@@ -114,13 +114,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same checkpoint. Other `pack-quantized` variants (asymmetric, 8-bit,
   quantized activations, `actorder`) fail closed, as do checkpoint tensors the
   plan has no rule for.
-- `StreamingTransformedBankSource` streams several same-shaped checkpoint
-  tensors through one callback into one initializer, for a target such as a
-  routed-expert bank whose stored layout (packed words, gate/up rows to
-  interleave) `StreamingExpertBankSource`'s value-casting row copy cannot
-  express. It reads its sources with one `safe_open` per shard: reopening the
-  shard for each of the thinker's 37k expert tensors took the same export
-  from 102 s to 964 s.
+- `StreamingTransformedBankSource` streams several checkpoint tensors (each
+  with its own declared shape, one dtype) through one callback into one
+  initializer, for a target such as a routed-expert bank or a joined Q/K/V
+  projection whose stored layout (packed words, gate/up rows to interleave)
+  `StreamingExpertBankSource`'s value-casting row copy cannot express. It
+  reads its sources with one `safe_open` per shard: reopening the shard for
+  each of the thinker's 37k expert tensors took the same export from 102 s to
+  964 s.
+- Checkpoints that quantize the thinker's attention themselves (integer-affine,
+  at most 8 bits, one scheme for Q/K/V: GPTQ, AWQ, Olive, compressed-tensors)
+  join Q/K/V into one `MatMulNBits` as float attention already did. Its
+  weights, scales and zero points are all rows of output features, so the
+  three join by concatenating rows after conversion, nothing requantized. One
+  `N = 5120` GEMV replaces 4096 + 512 + 512, removing the two small calls
+  that cost the most per byte: on an RTX 3090 a layer's INT4 Q/K/V go 17.0 ->
+  10.5 us and INT8 26.5 -> 16.7 us, and the INT4 AWQ thinker decodes 174.8 ->
+  181.0 tokens/s on ORT 1.29.
 - `MoELayer(fc1_rows_interleaved=True)` binds QMoE's fc1 tensors as given, for
   loaders that write them in the kernel's interleaved row order. Otherwise the
   graph reorders them and ORT folds that at session load, materialising every

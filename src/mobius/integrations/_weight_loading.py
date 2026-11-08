@@ -137,23 +137,24 @@ class StreamingTransformedWeightSource:
 
 @dataclasses.dataclass(frozen=True)
 class StreamingTransformedBankSource:
-    """Several same-shaped source tensors combined lazily into one target.
+    """Several source tensors combined lazily into one target.
 
     The multi-source counterpart of :class:`StreamingTransformedWeightSource`,
     for a target no single checkpoint tensor holds -- e.g. a routed-expert bank
-    assembled from per-expert projections whose stored layout (packed integer
-    words, gate/up rows to interleave) is not the graph's, which
-    :class:`StreamingExpertBankSource`'s value-casting row copy cannot express.
+    assembled from per-expert projections, or Q/K/V joined into one projection,
+    where the stored layout (packed integer words, gate/up rows to interleave)
+    is not the graph's, which :class:`StreamingExpertBankSource`'s
+    value-casting row copy cannot express.
 
-    Every source must have ``expected_source_shape`` and
-    ``expected_source_dtype``; ``transform`` receives them in ``source_names``
-    order. Both contracts are checked before any binding without running the
-    transform, which runs when ONNX external data is serialized, so the working
-    set is these sources plus one destination.
+    Source ``i`` must have shape ``expected_source_shapes[i]``, and every
+    source ``expected_source_dtype``; ``transform`` receives them in
+    ``source_names`` order. Both contracts are checked before any binding
+    without running the transform, which runs when ONNX external data is
+    serialized, so the working set is these sources plus one destination.
     """
 
     source_names: tuple[str, ...]
-    expected_source_shape: tuple[int, ...]
+    expected_source_shapes: tuple[tuple[int, ...], ...]
     expected_source_dtype: str
     expected_target_shape: tuple[int, ...]
     expected_target_dtype: ir.DataType
@@ -1088,20 +1089,29 @@ def stream_preprocessed_safetensors_to_model(
             _validate_transformed_target(initializer, source, target_name)
             if not source.source_names:
                 raise ValueError(f"Transformed bank for '{target_name}' has no sources")
+            if len(source.expected_source_shapes) != len(source.source_names):
+                raise ValueError(
+                    f"Transformed bank for '{target_name}' declares "
+                    f"{len(source.expected_source_shapes)} shapes for "
+                    f"{len(source.source_names)} sources"
+                )
             source_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(source.expected_source_dtype)
             if source_element_bytes is None:
                 raise ValueError(
                     f"Transformed bank for '{target_name}' declares unsupported "
                     f"byte-size dtype {source.expected_source_dtype}"
                 )
-            for source_name in source.source_names:
+            bank_source_bytes = 0
+            for source_name, expected_source_shape in zip(
+                source.source_names, source.expected_source_shapes
+            ):
                 if source_name not in key_index:
                     raise ValueError(f"Streaming source '{source_name}' does not exist")
                 _source_path, source_shape, source_dtype = key_index[source_name]
-                if tuple(source_shape) != source.expected_source_shape:
+                if tuple(source_shape) != expected_source_shape:
                     raise ValueError(
                         f"Transformed bank source '{source_name}' has shape "
-                        f"{source_shape}; expected {list(source.expected_source_shape)}"
+                        f"{source_shape}; expected {list(expected_source_shape)}"
                     )
                 if source_dtype != source.expected_source_dtype:
                     raise ValueError(
@@ -1109,11 +1119,12 @@ def stream_preprocessed_safetensors_to_model(
                         f"{source_dtype}; expected {source.expected_source_dtype}"
                     )
                 consumed.add(source_name)
-            source_bytes = math.prod(source.expected_source_shape) * source_element_bytes
-            largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+                source_bytes = math.prod(expected_source_shape) * source_element_bytes
+                largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+                bank_source_bytes += source_bytes
             largest_reconstruction_working_set_bytes = max(
                 largest_reconstruction_working_set_bytes,
-                source_bytes * len(source.source_names) + target_bytes,
+                bank_source_bytes + target_bytes,
             )
         elif isinstance(source, StreamingTransformedWeightSource):
             _validate_transformed_target(initializer, source, target_name)
