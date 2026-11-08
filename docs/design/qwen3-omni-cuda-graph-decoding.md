@@ -307,3 +307,75 @@ float export's 98.0%. One position differed on a digit (`1` → `2`) where the
 float export was right. The worst-case KL of 0.16 is larger than a fake-quant
 study of the same scheme suggested (0.024), so **several clips are still
 needed** before treating this as settled.
+
+## INT4 compressed-tensors checkpoints on a 24 GB card (RTX 3090)
+
+llm-compressor's W4A16 output -- compressed-tensors `pack-quantized`,
+symmetric INT4 in power-of-two groups, from GPTQ, AWQ or RTN -- exports with
+every quantized tensor bound as stored. The packed int32 words of the
+attention projections and of each expert already are the 4-bit
+`MatMulNBits` / `QMoE` layout (low nibble first, offset by 8, which is the
+ops' implicit zero point), so the export reinterprets them rather than
+requantizing. The router, norms, embeddings, LM head and audio encoder stay
+float, as the checkpoint's `ignore` list leaves them. At group 32 the thinker
+is 20.5 GB, small enough for a 24 GB card with room for the static cache.
+
+```bash
+mobius build --config <compressed-tensors-w4a16-checkpoint> \
+    --dtype f16 --ep cuda --features static-cache,gqa-cache,gqa-fused-rope \
+    --max-seq-len 4096 --output <out>
+```
+
+Two things about the build matter on a small host:
+
+- **Weights stream.** `build_pack_quantized_streaming_plan` reads one expert
+  bank's sources and writes one destination at a time: 2.5 GB peak RSS and
+  102 s for the 30B AWQ build
+  (`cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit`, group 32) on a 16-core,
+  15 GB machine, where the eager loader would hold the 20 GB checkpoint. A
+  bank reads its 256 per-expert sources with one `safe_open` per shard;
+  reopening the shard for every tensor produced the same bytes in 964 s.
+- **QMoE's fc1 rows are written gate/up-interleaved**, so the graph emits no
+  reorder. With the reorder in the graph, ORT folds it at session load and
+  materialises every expert bank a second time on the host -- about 11 GB
+  here, which a 15 GB host does not have to spare.
+
+On the device the three sessions hold 19.1 GiB after creation and 22.3 GiB
+after the longest prefill below (the arena keeps its peak). Session creation
+takes 29 s.
+
+Measured on an RTX 3090 (SM86, ORT 1.29), batch 1, greedy decoding, with the
+driving loop above: the decode embedding routed through the host, two
+generations discarded after capture. The prompt is a fixed system and user
+turn around the audio, 162 text tokens plus 13 audio tokens per second.
+Prefill runs from the waveform to the first token: mel features on the CPU,
+audio encoder, embedding, decoder. For these runs the decoder's hidden states
+were sliced to the last position before the LM head, a graph edit outside
+mobius: the speech-language task returns logits for every prompt position,
+0.5 GB of fp16 at 1.7k tokens. vLLM 0.33 serves the same checkpoint for
+comparison (bf16 activations, Marlin kernels, `LLM.generate`).
+
+| audio | prompt tokens | prefill, ORT | prefill, vLLM | decode, ORT | decode, vLLM |
+|---|---|---|---|---|---|
+| 15 s | 357 | 83 ms | 98 ms | 176 tok/s | 175 tok/s |
+| 30 s | 552 | 133 ms | 148 ms | 176 tok/s | 176 tok/s |
+| 45 s | 747 | 167 ms | 194 ms | 175 tok/s | 174 tok/s |
+| 60 s | 942 | 212 ms | 233 ms | 175 tok/s | 173 tok/s |
+| 120 s | 1722 | 392 ms | 419 ms | 173 tok/s | 171 tok/s |
+
+At 45 s of audio the prefill is 11 ms of mel features, 29 ms of audio
+encoder, 1 ms of embedding and 123 ms of decoder.
+
+The decode embedding's host round trip -- the embedding session's `Run` plus
+the 4 KB copy into the captured graph's input -- costs 0.13 ms per step on
+this host, 2% of a step, against 0.06 ms on Blackwell.
+
+The greedy transcripts agree with vLLM's in content but not always in
+formatting. With timestamps and speaker labels removed and numerals
+normalised, 95-100% of characters match over five clips of 15-120 s; the
+formatting flips between `MM:SS.mmm` and `HH:MM:SS.mmm` timestamps and between
+Arabic and kanji numerals. vLLM flips at the same positions between its own
+bf16 and fp16 activations (also 95-100%), so this checkpoint is sensitive
+there rather than the export wrong. The exact check is the synthetic parity
+test against dequantized HF weights, which separates a gate/up row swap
+(4.6e-3) from the bound export (under 1e-5).

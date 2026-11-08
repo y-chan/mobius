@@ -99,6 +99,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch 1 cuBLAS is much faster on that layout: on an RTX PRO 6000 the 30B
   thinker's decode step went from 8.5 ms to 6.5 ms, the projections
   themselves from 3.67 ms to 1.58 ms.
+- compressed-tensors weight-only `pack-quantized` checkpoints (llm-compressor's
+  W4A16 from GPTQ, AWQ or RTN: symmetric INT4 in power-of-two groups, float
+  activations) export the Qwen3-Omni thinker with attention as 4-bit
+  `MatMulNBits` and the routed experts as `QMoE` (`expert_weight_bits=4`),
+  binding the checkpoint's packed words and scales as stored: they already are
+  those ops' 4-bit layout, so nothing is requantized. The router, norms,
+  embeddings, LM head and audio encoder stay float, as the checkpoint's
+  `ignore` list leaves them. Weights stream through
+  `build_pack_quantized_streaming_plan`, so the 30B AWQ build (group 32,
+  20.5 GB) exports in 102 s at 2.5 GB peak RSS on a 15 GB host, and it fits a
+  24 GB RTX 3090 at 19.1 GiB: there it prefills 45 s of audio in 167 ms and
+  decodes 175 tokens/s, against 194 ms and 174 tokens/s from vLLM 0.33 on the
+  same checkpoint. Other `pack-quantized` variants (asymmetric, 8-bit,
+  quantized activations, `actorder`) fail closed, as do checkpoint tensors the
+  plan has no rule for.
+- `StreamingTransformedBankSource` streams several same-shaped checkpoint
+  tensors through one callback into one initializer, for a target such as a
+  routed-expert bank whose stored layout (packed words, gate/up rows to
+  interleave) `StreamingExpertBankSource`'s value-casting row copy cannot
+  express. It reads its sources with one `safe_open` per shard: reopening the
+  shard for each of the thinker's 37k expert tensors took the same export
+  from 102 s to 964 s.
+- `MoELayer(fc1_rows_interleaved=True)` binds QMoE's fc1 tensors as given, for
+  loaders that write them in the kernel's interleaved row order. Otherwise the
+  graph reorders them and ORT folds that at session load, materialising every
+  expert bank a second time on the host (about 11 GB for the INT4 thinker).
 
 #### Fixed
 
