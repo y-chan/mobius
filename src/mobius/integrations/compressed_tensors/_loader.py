@@ -142,6 +142,14 @@ class CompressedTensorsConfig:
         value = _normalize_config_value(getattr(hf_config, "quantization_config", None))
         if not is_compressed_tensors_config(value):
             return None
+        # Integer weight-only pack-quantized checkpoints are a different
+        # container, carried by QuantizationConfig instead (see _int_weights).
+        from mobius.integrations.compressed_tensors._int_weights import (
+            parse_pack_quantized_int_scheme,
+        )
+
+        if parse_pack_quantized_int_scheme(value) is not None:
+            return None
         return cls.parse(value)
 
     @classmethod

@@ -140,7 +140,9 @@ def supported_qmoe_quantization(
 
     Accepts the integer-affine int4 block schemes whose ``(q - zero_point) *
     scale`` dequantization is byte-identical to ``MatMulNBits`` and to the
-    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, and Olive RTN. Symmetric int8
+    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, Olive RTN, and compressed-tensors
+    weight-only ``pack-quantized`` (symmetric INT4 only, see
+    :mod:`mobius.integrations.compressed_tensors._int_weights`). Symmetric int8
     blocks are accepted as well (one uint8 per weight, implicit zero point
     128); asymmetric int8 is not, because its packed zero-point layout has not
     been validated against the kernel. The CUDA QMoE kernel requires a
@@ -153,7 +155,7 @@ def supported_qmoe_quantization(
         or (quantization.bits == 8 and not quantization.sym)
         or quantization.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
         or quantization.float_zero_point
-        or quantization.quant_method not in {"gptq", "awq", "olive"}
+        or quantization.quant_method not in {"gptq", "awq", "olive", "compressed-tensors"}
     ):
         return None
     block_size = quantization.group_size

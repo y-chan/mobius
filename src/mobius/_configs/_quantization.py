@@ -164,9 +164,23 @@ class QuantizationConfig:
         from mobius.integrations.compressed_tensors import (
             CompressedTensorsConfig,
             is_compressed_tensors_config,
+            parse_pack_quantized_int_scheme,
         )
 
         if is_compressed_tensors_config(qc):
+            # The one compressed-tensors layout that *is* plain integer-affine
+            # blocks: weight-only symmetric group-wise INT4 ``pack-quantized``
+            # (llm-compressor W4A16). Models bind its packed words through a
+            # streaming plan; ``ignore`` names the modules left in float.
+            int_scheme = parse_pack_quantized_int_scheme(qc)
+            if int_scheme is not None:
+                return cls(
+                    bits=int_scheme.num_bits,
+                    group_size=int_scheme.group_size,
+                    quant_method="compressed-tensors",
+                    sym=True,
+                    modules_to_not_convert=int_scheme.ignore,
+                )
             CompressedTensorsConfig.parse(qc)
             return None
         # Block-scaled fp8 (E4M3 weight + 2D UE8M0 block scale) and packed-fp4

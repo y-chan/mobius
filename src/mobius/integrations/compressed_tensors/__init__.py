@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+from mobius.integrations.compressed_tensors._int_weights import (
+    PackQuantizedIntScheme,
+    packed_weight_bytes,
+    parse_pack_quantized_int_scheme,
+)
 from mobius.integrations.compressed_tensors._loader import (
     CompressedTensorsConfig,
     CompressedTensorsError,
@@ -17,6 +22,9 @@ __all__ = [
     "CompressedTensorsConfig",
     "CompressedTensorsError",
     "CompressedTensorsLoadReport",
+    "PackQuantizedIntScheme",
     "is_compressed_tensors_config",
+    "packed_weight_bytes",
+    "parse_pack_quantized_int_scheme",
     "stream_compressed_tensors_to_package",
 ]
