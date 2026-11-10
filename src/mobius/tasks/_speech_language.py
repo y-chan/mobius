@@ -46,6 +46,9 @@ class SpeechLanguageTask(ModelTask):
             (see :func:`~mobius.tasks._base.build_decoder_from_embeds`).
         max_seq_len: Static cache length; defaults to
             ``config.max_position_embeddings``.
+        paged_cache: Build the decoder on a block-paged cache owned by
+            ``com.microsoft::PagedAttention`` (``paged-gqa``; see
+            :func:`~mobius.tasks._base.build_decoder_from_embeds`).
     """
 
     model_roles: ClassVar[dict[str, str]] = {
@@ -65,10 +68,12 @@ class SpeechLanguageTask(ModelTask):
         static_cache: bool = False,
         max_seq_len: int | None = None,
         gqa_cache: bool = False,
+        paged_cache: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
         self._gqa_cache = gqa_cache
+        self._paged_cache = paged_cache
 
     def build(
         self,
@@ -93,6 +98,7 @@ class SpeechLanguageTask(ModelTask):
             static_cache=self._static_cache,
             max_seq_len=self._max_seq_len,
             gqa_cache=self._gqa_cache,
+            paged_cache=self._paged_cache,
         )
         return ModelPackage(models, config=config)
 

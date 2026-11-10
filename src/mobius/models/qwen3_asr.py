@@ -39,6 +39,7 @@ from mobius.components._qwen3_asr_audio import (
 )
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import initialize_rope
+from mobius.models.base import _retain_logit_tokens
 
 
 def _sinusoidal_position_embedding(max_positions: int, d_model: int) -> np.ndarray:
@@ -556,7 +557,7 @@ class Qwen3ASRDecoderModel(nn.Module):
             )
             present_key_values.append(present_kv)
 
-        hidden_states = self.norm(op, hidden_states)
+        hidden_states = self.norm(op, _retain_logit_tokens(op, hidden_states))
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 

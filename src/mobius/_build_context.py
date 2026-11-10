@@ -50,6 +50,9 @@ _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
 _prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mobius_prune_prefill_prefix", default=False
 )
+_logit_token_indices: contextvars.ContextVar[ir.Value | None] = contextvars.ContextVar(
+    "mobius_logit_token_indices", default=None
+)
 
 
 @contextmanager
@@ -133,3 +136,23 @@ def prefill_prefix_pruning(enabled: bool) -> Iterator[None]:
 def is_prefill_prefix_pruning_enabled() -> bool:
     """Return whether the active task discards prefill tokens before the final token."""
     return _prune_prefill_prefix.get()
+
+
+@contextmanager
+def logit_token_selection(indices: ir.Value | None) -> Iterator[None]:
+    """Project only the sequence positions in ``indices`` (INT64 ``[num_logits]``) to logits.
+
+    Used by the paged decoder, whose single packed sequence holds every scheduled request's tokens:
+    the caller names the positions it needs (the last token of each request) instead of the graph
+    projecting all of them to the vocabulary.
+    """
+    token = _logit_token_indices.set(indices)
+    try:
+        yield
+    finally:
+        _logit_token_indices.reset(token)
+
+
+def logit_token_indices() -> ir.Value | None:
+    """Return the positions to project to logits, or ``None`` for all of them."""
+    return _logit_token_indices.get()

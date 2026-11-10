@@ -23,6 +23,7 @@ from mobius._build_context import (
     ep_capabilities,
     get_build_dtype,
     is_prefill_prefix_pruning_enabled,
+    logit_token_indices,
 )
 from mobius._configs import ArchitectureConfig, CausalLMConfig, QuantizedWeightFormat
 from mobius._flags import flags
@@ -517,6 +518,18 @@ def _retain_last_sequence_token(op: OpBuilder, hidden_states: ir.Value) -> ir.Va
         return hidden_states
     last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)
     return op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))
+
+
+def _retain_logit_tokens(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    """Keep the sequence positions selected by ``logit_token_selection`` (``[B, S, H]`` -> ``[B, N, H]``).
+
+    A no-op unless the task supplied the indices (the paged decoder does); then only the named positions
+    reach the LM head, which at a long prefill is most of the step's cost.
+    """
+    indices = logit_token_indices()
+    if indices is None:
+        return hidden_states
+    return op.Gather(hidden_states, indices, axis=1)
 
 
 class LayerNormTextModel(TextModel):

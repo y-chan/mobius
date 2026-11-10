@@ -1199,3 +1199,137 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
     finally:
         for session in sessions.values():
             session.close()
+
+
+def test_paged_gqa_matches_static_gqa(omni):
+    """``paged-gqa``: PagedAttention over a block-paged cache in place of GQA's static one.
+
+    The node census and the decoder's inputs are checked everywhere. Where a CUDA provider is
+    present (PagedAttention and the folded Q/K norm are CUDA kernels), a prompt and three decode
+    steps of one request, packed into the paged decoder's single sequence, must give the static
+    GQA decoder's logits; the request's blocks are deliberately out of order in the pool.
+    """
+    import tempfile
+    from pathlib import Path
+
+    config, hf_model, _ = omni
+    state_dict = {f"thinker.{k}": v.detach() for k, v in hf_model.state_dict().items()}
+    variant = dataclasses.replace(config, gqa_fused_rope=True, dtype=ir.DataType.FLOAT16)
+    builds = {}
+    for name, paged in (("static", False), ("paged", True)):
+        module = Qwen3OmniThinkerForConditionalGeneration(variant)
+        package = build_from_module(
+            module,
+            variant,
+            task=SpeechLanguageTask(
+                static_cache=True,
+                max_seq_len=_STATIC_MAX_SEQ_LEN,
+                gqa_cache=True,
+                paged_cache=paged,
+            ),
+        )
+        package.apply_weights(module.preprocess_weights(state_dict))
+        builds[name] = package["decoder"]
+
+    paged = builds["paged"]
+    counts = collections.Counter(n.op_type for n in paged.graph.all_nodes())
+    assert counts["PagedAttention"] == config.num_hidden_layers
+    assert counts["GroupQueryAttention"] == 0
+    assert counts["RotaryEmbedding"] == 0
+    # The op takes each token's rotary position from past_seqlens, so position_ids drops out.
+    assert {i.name for i in paged.graph.inputs if "cache" not in i.name} == {
+        "inputs_embeds",
+        "cumulative_sequence_length",
+        "past_seqlens",
+        "block_table",
+        "attention_metadata",
+        "logits_indices",
+    }
+
+    import onnxruntime as ort
+
+    ort.preload_dlls()
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        pytest.skip("PagedAttention is a CUDA kernel")
+
+    layers = range(config.num_hidden_layers)
+    kv_heads, head_dim = config.num_key_value_heads, config.head_dim
+    block_size, num_blocks = 16, 8  # the op wants a power of two >= 16
+    blocks = np.array([5, 2, 7, 0], np.int32)  # the request's blocks, out of order in the pool
+    tmp = tempfile.TemporaryDirectory()
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    sessions = {}
+    for name, graph in builds.items():
+        path = str(Path(tmp.name) / f"{name}.onnx")
+        ir.save(graph, path, external_data=f"{name}.onnx.data")
+        sessions[name] = ort.InferenceSession(path, so, providers=["CUDAExecutionProvider"])
+    if any("CUDAExecutionProvider" not in s.get_providers() for s in sessions.values()):
+        pytest.skip("the CUDA provider could not be loaded")
+    paged_session, static_session = sessions["paged"], sessions["static"]
+    static_outputs = [o.name for o in static_session.get_outputs()]
+    pools = {
+        f"{kind}_cache.{i}": ort.OrtValue.ortvalue_from_numpy(
+            np.zeros((num_blocks, block_size, kv_heads, head_dim), np.float16), "cuda", 0
+        )
+        for i in layers
+        for kind in ("key", "value")
+    }
+    static_caches = {
+        f"{kind}_cache.{i}": np.zeros((1, kv_heads, _STATIC_MAX_SEQ_LEN, head_dim), np.float16)
+        for i in layers
+        for kind in ("key", "value")
+    }
+
+    rng = np.random.default_rng(29)
+    # A 20-token prompt and three steps cross from the first block into the second.
+    steps = [rng.standard_normal((1, 20, config.hidden_size)).astype(np.float16)] + [
+        rng.standard_normal((1, 1, config.hidden_size)).astype(np.float16) for _ in range(3)
+    ]
+    try:
+        past_len = 0
+        for embeds in steps:
+            seq = embeds.shape[1]
+            pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+            static_out = dict(
+                zip(
+                    static_outputs,
+                    static_session.run(
+                        None,
+                        {
+                            "inputs_embeds": embeds,
+                            "position_ids": np.stack([pos, pos, pos])[:, None, :],
+                            "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+                            **static_caches,
+                        },
+                    ),
+                    strict=True,
+                )
+            )
+            static_caches = {n: static_out[f"updated_{n}"] for n in static_caches}
+
+            binding = paged_session.io_binding()
+            binding.bind_cpu_input("inputs_embeds", embeds)
+            binding.bind_cpu_input("cumulative_sequence_length", np.array([0, seq], np.int32))
+            binding.bind_cpu_input("past_seqlens", np.array([past_len], np.int32))
+            binding.bind_cpu_input("block_table", blocks[None])
+            binding.bind_cpu_input("attention_metadata", np.array([seq, past_len + seq], np.int32))
+            binding.bind_cpu_input("logits_indices", np.array([seq - 1], np.int64))
+            binding.bind_output("logits", "cpu")
+            for name, pool in pools.items():
+                binding.bind_ortvalue_input(name, pool)
+                binding.bind_ortvalue_output(f"updated_{name}", pool)
+            paged_session.run_with_iobinding(binding)
+            paged_logits = binding.get_outputs()[0].numpy()
+
+            np.testing.assert_allclose(
+                paged_logits[0, -1],
+                static_out["logits"][0, -1],
+                # Both sides are float16 and differ in where the cache lives, not in the math.
+                rtol=2e-2,
+                atol=2e-2,
+            )
+            past_len += seq
+    finally:
+        del paged_session, static_session, sessions
+        tmp.cleanup()

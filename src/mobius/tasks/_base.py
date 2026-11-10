@@ -227,6 +227,7 @@ def build_decoder_from_embeds(
     static_cache: bool = False,
     max_seq_len: int | None = None,
     gqa_cache: bool = False,
+    paged_cache: bool = False,
 ) -> ir.Model:
     """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
 
@@ -265,6 +266,18 @@ def build_decoder_from_embeds(
             ``docs/design/qwen3-omni-cuda-graph-decoding.md``.
         max_seq_len: Static cache length. Defaults to
             ``config.max_position_embeddings``.
+        paged_cache: With ``static_cache`` and ``gqa_cache``, let
+            ``com.microsoft::PagedAttention`` own a block-paged cache instead
+            (``paged-gqa``; the decoder must fold the rotary into the op, i.e.
+            ``gqa_fused_rope``). Per layer ``key_cache.{i}`` / ``value_cache.{i}``
+            become ``[num_blocks, block_size, kv_heads, head_dim]`` pools; the
+            shared inputs are ``cumulative_sequence_length``, ``past_seqlens``,
+            ``block_table``, ``attention_metadata`` (host) and ``logits_indices``.
+            ``inputs_embeds`` holds every scheduled request's new tokens packed
+            into one sequence (batch 1), and ``logits`` has one row per entry of
+            ``logits_indices`` (positions in that sequence). Every decode step of
+            a fixed request count then has fixed shapes, with the context
+            lengths and the block assignment on the device.
 
     Returns:
         A built :class:`ir.Model` for the decoder.
@@ -296,6 +309,10 @@ def build_decoder_from_embeds(
         if max_seq_len is None or max_seq_len <= 0:
             raise ValueError("max_seq_len must be a positive integer for static cache.")
         _validate_static_cache_support(decoder)
+    if paged_cache and not (static_cache and gqa_cache):
+        raise ValueError("paged_cache needs static_cache and gqa_cache (features static-cache,gqa-cache,paged-gqa)")
+    if paged_cache and not getattr(config, "gqa_fused_rope", False):
+        raise ValueError("paged_cache folds the Q/K norm and rotary into PagedAttention; it needs gqa_fused_rope")
 
     graph, builder = _make_graph()
     inputs_embeds = builder.input(
@@ -332,7 +349,17 @@ def build_decoder_from_embeds(
             shape=[batch, seq_len, num_deepstack * config.hidden_size],
         )
 
-    if static_cache:
+    logits_indices = None
+    if paged_cache:
+        past_key_values = _make_paged_gqa_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+        )
+        logits_indices = builder.input("logits_indices", dtype=ir.DataType.INT64, shape=["num_logits"])
+    elif static_cache:
         from mobius.tasks._causal_lm import _make_static_cache_inputs
 
         past_key_values = _make_static_cache_inputs(
@@ -368,14 +395,17 @@ def build_decoder_from_embeds(
     if per_layer_inputs is not None:
         decoder_kwargs["per_layer_inputs"] = per_layer_inputs
 
-    logits, present_key_values = decoder(
-        builder.op,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        **decoder_kwargs,
-    )
+    from mobius._build_context import logit_token_selection
+
+    with logit_token_selection(logits_indices):
+        logits, present_key_values = decoder(
+            builder.op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **decoder_kwargs,
+        )
 
     builder.add_output(logits, "logits")
 
@@ -490,3 +520,53 @@ def build_embedding_from_features(
     else:
         builder.add_output(outputs, "inputs_embeds")
     return _make_model(graph)
+
+
+def _make_paged_gqa_cache_inputs(
+    builder,
+    num_layers: int,
+    num_key_value_heads: int,
+    head_dim: int,
+    dtype: ir.DataType,
+) -> list:
+    """Create the ``paged-gqa`` decoder inputs: per-layer block pools and the shared request tables.
+
+    Returns one :class:`~mobius.components._attention.StaticCacheState` per layer carrying the
+    PagedAttention fields (see its docstring). The pools' block count and block size are symbolic, so
+    the caller picks the pool size and the page size at load time.
+    """
+    from mobius.components._attention import StaticCacheState
+
+    num_blocks = ir.SymbolicDim("num_blocks")
+    block_size = ir.SymbolicDim("block_size")
+    num_seqs = ir.SymbolicDim("num_seqs")
+    cache_shape = [num_blocks, block_size, num_key_value_heads, head_dim]
+    caches = []
+    for i in range(num_layers):
+        caches.append(
+            (
+                builder.input(f"key_cache.{i}", dtype=dtype, shape=cache_shape),
+                builder.input(f"value_cache.{i}", dtype=dtype, shape=cache_shape),
+            )
+        )
+    cumulative = builder.input(
+        "cumulative_sequence_length", dtype=ir.DataType.INT32, shape=["num_seqs + 1"]
+    )
+    past = builder.input("past_seqlens", dtype=ir.DataType.INT32, shape=[num_seqs])
+    block_table = builder.input(
+        "block_table", dtype=ir.DataType.INT32, shape=[num_seqs, "max_blocks_per_seq"]
+    )
+    metadata = builder.input("attention_metadata", dtype=ir.DataType.INT32, shape=[2])
+    return [
+        StaticCacheState(
+            key_cache=key_cache,
+            value_cache=value_cache,
+            write_indices=None,
+            nonpad_kv_seqlen=None,
+            cumulative_seqlens_q=cumulative,
+            past_seqlens=past,
+            block_table=block_table,
+            attention_metadata=metadata,
+        )
+        for key_cache, value_cache in caches
+    ]

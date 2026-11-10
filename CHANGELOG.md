@@ -73,6 +73,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CPU EP. **The decoder loses its `position_ids` input** -- the op derives
   the rotary position from the KV length -- so a driving loop feeds one fewer
   tensor.
+- `--features static-cache,gqa-cache,gqa-fused-rope,paged-gqa` builds the
+  speech-language decoder on a block-paged KV cache owned by
+  `com.microsoft::PagedAttention` instead of GQA's per-request static
+  buffers. Each layer takes a `[num_blocks, block_size, kv_heads, head_dim]`
+  pool (both dims symbolic), and every scheduled request's new tokens run as
+  one packed sequence: `inputs_embeds [1, num_tokens, hidden]` with
+  `cumulative_sequence_length`, `past_seqlens`, `block_table`,
+  `attention_metadata` (host) and `logits_indices`, which picks the
+  positions projected to the vocabulary (the LM head no longer sees a whole
+  prompt). The Q/K norm and the rotary stay inside the op, whose rotary
+  position is `past_seqlens + i`, so `position_ids` is gone. A request then
+  holds only the blocks its context fills, rather than a `max_seq_len` slot.
+  On an RTX 3090 with ONNX Runtime's opt-in split-decode path for
+  PagedAttention, a decode step matches the static GQA cache (3.98 vs 3.89 ms
+  at one request) and a 24 GB card holds a 40k-token fp16 pool (80k with an
+  8-bit cache) next to the INT4 thinker, against 8 (16) static 4096-token
+  slots. See `docs/design/qwen3-omni-cuda-graph-decoding.md`.
 - `--features static-cache,gqa-cache` hands the static KV cache to
   `com.microsoft::GroupQueryAttention` instead of `TensorScatter` +
   `Attention`. The op appends the new key/value itself, so the buffers become

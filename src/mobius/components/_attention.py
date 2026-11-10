@@ -90,14 +90,35 @@ class StaticCacheState(NamedTuple):
             selects it.
         total_seq_len: Scalar int32 total KV length. GQA takes it alongside
             ``seqlens_k``; present only on the GQA path.
+
+    A third emission is ``com.microsoft::PagedAttention`` over a block-paged
+    cache, selected by ``block_table`` (``paged-gqa``). The caller owns a pool
+    of fixed-size blocks per layer and maps each request onto it, so a request
+    holds only the blocks its context fills. The decoder runs every scheduled
+    request as one packed sequence (``inputs_embeds [1, num_tokens, hidden]``);
+    the op splits it with ``cumulative_seqlens_q`` and appends each request's
+    new tokens after its ``past_seqlens`` cached ones.
+
+        key_cache / value_cache: ``[num_blocks, block_size, kv_heads, head_dim]``.
+        cumulative_seqlens_q: ``[num_seqs + 1]`` int32 token offsets of the
+            requests in the packed sequence.
+        past_seqlens: ``[num_seqs]`` int32 cached tokens per request.
+        block_table: ``[num_seqs, max_blocks_per_seq]`` int32 block ids.
+        attention_metadata: ``[2]`` int32 on the host, bounds on the per-request
+            query and KV lengths (``[1, ...]`` lets a decode step take the split
+            decode kernel); see the PagedAttention op.
     """
 
     key_cache: ir.Value
     value_cache: ir.Value
     write_indices: ir.Value | None
-    nonpad_kv_seqlen: ir.Value
+    nonpad_kv_seqlen: ir.Value | None
     seqlens_k: ir.Value | None = None
     total_seq_len: ir.Value | None = None
+    cumulative_seqlens_q: ir.Value | None = None
+    past_seqlens: ir.Value | None = None
+    block_table: ir.Value | None = None
+    attention_metadata: ir.Value | None = None
 
 
 def _apply_attention(
@@ -388,16 +409,20 @@ class Attention(nn.Module):
         # Folded path: GQA takes the norm weights and the rotary tables and does
         # both inside the kernel, so neither is emitted here. The per-head norm
         # is the only form it implements, and it runs before the rotary, which
-        # is the order this module uses too.
+        # is the order this module uses too. PagedAttention folds them the same way.
         if (
             static_cache is not None
-            and static_cache.seqlens_k is not None
+            and (static_cache.seqlens_k is not None or static_cache.block_table is not None)
             and isinstance(attention_bias, GQAContext)
         ):
             if self.q_norm is None or self.k_norm is None or self._qk_norm_full:
                 raise ValueError(
                     "fused GQA rotary expects per-head Q/K norm; this attention "
                     f"has qk_norm={self.q_norm is not None}, full={self._qk_norm_full}"
+                )
+            if static_cache.block_table is not None:
+                return self._forward_paged(
+                    op, query_states, key_states, value_states, attention_bias, static_cache
                 )
             return self._forward_gqa_static(
                 op, query_states, key_states, value_states, attention_bias, static_cache
@@ -553,6 +578,76 @@ class Attention(nn.Module):
             _outputs=3,
             **attrs,
         )
+        return self._project_output(op, attn_out), (present_key, present_value)
+
+    def _forward_paged(
+        self,
+        op: OpBuilder,
+        query_states: ir.Value,
+        key_states: ir.Value,
+        value_states: ir.Value,
+        gqa_ctx: GQAContext,
+        cache: StaticCacheState,
+    ):
+        """Emit ``com.microsoft::PagedAttention`` over a block-paged cache.
+
+        The op works on packed tokens, so the ``[1, num_tokens, width]``
+        projections are flattened to ``[num_tokens, width]`` around it. The
+        Q/K norm and the rotary run inside it as on the folded GQA path; the
+        rotary position of a request's token ``i`` is ``past_seqlens + i``,
+        which is the position the model was given wherever the cache fills
+        front to back (``gqa_ctx.position_ids`` is therefore not an input).
+        """
+        attrs: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scaling,
+            "do_rotary": 1,
+            "rotary_interleaved": int(self._rope_interleave),
+            "qk_norm_epsilon": self.q_norm.variance_epsilon,
+        }
+        if self._softcap:
+            attrs["softcap"] = self._softcap
+        if gqa_ctx.local_window_size > 0:
+            attrs["local_window_size"] = gqa_ctx.local_window_size
+
+        norm_weights = []
+        for norm in (self.q_norm, self.k_norm):
+            op.builder.push_module(norm.name or "norm", type(norm).__qualname__)
+            try:
+                norm.weight._realize(op.builder)
+            finally:
+                op.builder.pop_module()
+            norm_weights.append(norm.weight)
+
+        q_width = self.num_attention_heads * self.head_dim
+        kv_width = self.num_key_value_heads * self.head_dim
+        query_tokens = op.Reshape(query_states, op.Constant(value_ints=[-1, q_width]))
+        key_tokens = op.Reshape(key_states, op.Constant(value_ints=[-1, kv_width]))
+        value_tokens = op.Reshape(value_states, op.Constant(value_ints=[-1, kv_width]))
+        attn_out, present_key, present_value = op.PagedAttention(  # type: ignore[attr-defined]
+            query_tokens,  # [num_tokens, num_heads * head_dim]
+            key_tokens,
+            value_tokens,
+            cache.key_cache,  # [num_blocks, block_size, kv_heads, head_dim]
+            cache.value_cache,
+            cache.cumulative_seqlens_q,  # [num_seqs + 1] int32
+            cache.past_seqlens,  # [num_seqs] int32
+            cache.block_table,  # [num_seqs, max_blocks_per_seq] int32
+            gqa_ctx.cos_cache,
+            gqa_ctx.sin_cache,
+            None,  # slot_mapping: derived from block_table and past_seqlens
+            None,  # head_sink
+            *norm_weights,
+            None,  # k_scale
+            None,  # v_scale
+            cache.attention_metadata,  # [2] int32, host
+            _domain="com.microsoft",
+            _outputs=3,
+            **attrs,
+        )
+        # Back to [1, num_tokens, num_heads * head_dim] (v_head_size == head_dim).
+        attn_out = op.Reshape(attn_out, op.Shape(query_states))
         return self._project_output(op, attn_out), (present_key, present_value)
 
     def _forward_gqa(

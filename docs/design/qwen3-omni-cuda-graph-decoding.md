@@ -391,3 +391,69 @@ bf16 and fp16 activations (also 95-100%), so this checkpoint is sensitive
 there rather than the export wrong. The exact check is the synthetic parity
 test against dequantized HF weights, which separates a gate/up row swap
 (4.6e-3) from the bound export (under 1e-5).
+
+## Block-paged KV cache (`paged-gqa`, RTX 3090)
+
+A static cache reserves `max_seq_len` per request whether or not the request
+uses it, so on a 24 GB card next to the INT4 thinker (18,866 MiB with the audio
+encoder and the embedding) it fits 8 fp16 slots of 4096 tokens, or 16 with an
+8-bit cache. `--features static-cache,gqa-cache,gqa-fused-rope,paged-gqa`
+exports the decoder on `com.microsoft::PagedAttention` instead: one pool of
+fixed-size blocks per layer, shared by every request, each holding only the
+blocks its context fills.
+
+The driving loop owns the pool and a free list, and runs the scheduled
+requests as one packed sequence:
+
+- **Prefill** of one request: `inputs_embeds [1, L, hidden]`,
+  `cumulative_sequence_length [0, L]`, `past_seqlens [0]`, its row of
+  `block_table` (unused entries -1), `attention_metadata [L, L]` and
+  `logits_indices [L - 1]`.
+- **Decode** of `n` requests, one token each: `inputs_embeds [1, n, hidden]`,
+  `cumulative_sequence_length 0..n`, each request's `past_seqlens` and
+  block-table row, `logits_indices 0..n-1`, and `attention_metadata
+  [1, capacity]`. The query bound of 1 is what lets the step take ONNX
+  Runtime's split decode kernel; the KV bound is replay-wide, so one CUDA
+  graph per request count (`gpu_graph_id = n`) stays valid as the contexts
+  grow. Reserve a new block before a step whose token starts one.
+- The block caches are bound as input and output to the same buffers (the op
+  rejects anything else).
+
+On ORT's default backends a PagedAttention decode step is slow on this card:
+XQA does not fit its shared memory, so a step falls to the portable paged
+decode kernel or to a gathered copy of the context, 3-8x the attention time
+of GQA's split decode. The numbers below use the opt-in split decode path for
+PagedAttention (`ORT_PAGED_ATTENTION_SPLIT_DECODE=1`, y-chan/onnxruntime
+`perf/gqa-split-decode-8bit-paged`).
+
+Decoder step only (no embedding `Run`, no logits readback), CUDA graph,
+block 16, a different token per request so the MoE routes the rows apart:
+
+| requests | context | static fp16 / INT8 | paged fp16 | paged INT8 | paged FP8 |
+|---|---|---|---|---|---|
+| 1 | 750 | 3.89 / 3.93 ms | 3.98 ms | 4.01 ms | 4.02 ms |
+| 8 | 750 | 11.9 / 12.2 ms | 11.3 ms | 11.3 ms | 11.3 ms |
+| 16 | 750 | - / 18.3 ms | 17.6 ms | 17.1 ms | 17.3 ms |
+| 32 | 750 | - | 23.7 ms | 22.8 ms | 22.9 ms |
+| 8 | 3500 | 14.5 / 13.4 ms | 13.4 ms | 12.6 ms | 12.4 ms |
+| 16 | 3500 | - / 20.7 ms | (pool full) | 21.0 ms | 20.1 ms |
+
+At more than one request the step time depends on how far the rows' expert
+choices overlap, so the static and paged columns differ by about as much as
+two runs of either with different tokens. Prefill is the same within 3%
+(747 tokens: 127 ms at block 16, 125 ms at block 256).
+
+Memory (nvidia-smi, 24,576 MiB card): with a 40k-token fp16 pool (80k for
+INT8 / FP8, the same 3,750 MiB) the loaded pipeline uses 22,916 MiB and 23,516
+MiB after 32-request decode steps, leaving about 1,060 MiB for the audio
+encoder's prefill workspace (600-850 MiB at 20 s of audio, arena shrinkage
+on; not measured together with a full pool).
+
+Teacher-forced on the same reference tokens (15 / 45 / 120 s clips), the paged
+decoder against the static one gives a mean KL of 8e-4, top-1 agreement
+99.6-100%; three requests decoded together against each alone, 3e-4 to 8e-4.
+That is the model's own floor for fp16 arithmetic: the static decoder with the
+split decode kernel against the regular Flash path measures 2.4e-4 to 9.2e-4.
+In a single attention node, GQA and PagedAttention are both within fp16
+rounding of an fp32 reference (cached K: 0.5 against 1 ulp).
+

@@ -39,6 +39,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "paged-attention": "export_paged_attention",
     "gqa-cache": "gqa_cache",
     "gqa-fused-rope": "gqa_fused_rope",
+    "paged-gqa": "paged_gqa",
     "attn-int8": "attn_int8",
     "lm-head-int8": "lm_head_int8",
 }
@@ -180,6 +181,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 static_cache=True,
                 max_seq_len=args.max_seq_len,
                 gqa_cache=args.gqa_cache,
+                paged_cache=getattr(args, "paged_gqa", False),
             )
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
 
@@ -212,6 +214,17 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Error: --features gqa-fused-rope folds the Q/K norm and the rotary "
             "into GroupQueryAttention; pass --features static-cache,gqa-cache,"
             "gqa-fused-rope."
+        )
+
+    # The paged decoder folds the Q/K norm and the rotary into PagedAttention like
+    # the fused GQA path, and is built by the same static-cache task.
+    if getattr(args, "paged_gqa", False) and not (
+        args.static_cache and args.gqa_cache and args.gqa_fused_rope
+    ):
+        raise SystemExit(
+            "Error: --features paged-gqa builds the decoder on a block-paged "
+            "PagedAttention cache; pass --features static-cache,gqa-cache,"
+            "gqa-fused-rope,paged-gqa."
         )
 
     # GQA owns the cache it is given, so there has to be one.
