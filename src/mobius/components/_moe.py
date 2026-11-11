@@ -251,9 +251,9 @@ class SoftmaxTopKGate(nn.Module):
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
         """Return selection and aggregation tensors for QMoE.
 
-        ``router_probs`` (QMoE input 1) is the raw logits (cast to hidden_states's dtype) and the
-        pre-softmaxed probabilities are passed as ``router_weights`` (input
-        14). CUDA QMoE ignores ``router_weights`` and applies softmax-top-k on
+        ``router_probs`` (QMoE input 1) is the raw logits (cast to hidden_states's dtype). Without
+        ``norm_topk_prob`` the pre-softmaxed probabilities are passed as ``router_weights`` (input
+        14); with it they are not needed (see the body). CUDA QMoE ignores ``router_weights`` and applies softmax-top-k on
         ``router_probs``, so feeding logits reproduces ``forward`` exactly
         (``Softmax`` then top-k then renormalize); feeding pre-softmaxed probs
         here would double-softmax on CUDA. CPU QMoE selects the top-k over
@@ -268,6 +268,13 @@ class SoftmaxTopKGate(nn.Module):
         # ``input`` (see contrib_defs.cc), so it must match hidden_states'
         # dtype rather than a fixed float32.
         router_logits = op.CastLike(router_logits, hidden_states)
+        if self.norm_topk_prob:
+            # Renormalizing the top-k of the full softmax equals the softmax of the top-k
+            # logits, which is what QMoE computes from router_probs with
+            # normalize_routing_weights=1 and no router_weights, on CPU and CUDA alike
+            # (as for TopKGate). The full softmax would only be read by the CPU kernel,
+            # to the same result, and costs a launch per layer on CUDA, which never reads it.
+            return router_logits, None, True, self.routed_scaling_factor
         routing_probs = op.Softmax(router_logits, axis=-1)
         return (
             router_logits,

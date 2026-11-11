@@ -73,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CPU EP. **The decoder loses its `position_ids` input** -- the op derives
   the rotary position from the KV length -- so a driving loop feeds one fewer
   tensor.
+- `SoftmaxTopKGate` with `norm_topk_prob` (Qwen3 MoE, Qwen3-Omni) no longer
+  emits the full-softmax `router_weights` for QMoE: renormalizing the top-k
+  of the full softmax is the softmax of the top-k logits, which QMoE computes
+  from `router_probs` with `normalize_routing_weights=1` on CPU and CUDA,
+  and the CUDA kernel never read the input. 48 fewer `Softmax` launches per
+  token; on an RTX 3090 the INT4 thinker's logits are bitwise unchanged and
+  decode goes 242.1 -> 245.5 tokens/s.
 - With `gqa-fused-rope` (and `paged-gqa`), a joined `[Q | K | V]`
   projection (`FusedQKVAttention`) now goes into GroupQueryAttention /
   PagedAttention packed, with key and value absent, instead of being split
