@@ -402,24 +402,35 @@ class Attention(nn.Module):
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
     ):
-        query_states, key_states, value_states = self._project_qkv(op, hidden_states)
-        if not math.isclose(self._key_multiplier, 1.0):
-            key_states = op.Mul(key_states, self._key_multiplier)
-
         # Folded path: GQA takes the norm weights and the rotary tables and does
         # both inside the kernel, so neither is emitted here. The per-head norm
         # is the only form it implements, and it runs before the rotary, which
         # is the order this module uses too. PagedAttention folds them the same way.
-        if (
+        folded = (
             static_cache is not None
             and (static_cache.seqlens_k is not None or static_cache.block_table is not None)
             and isinstance(attention_bias, GQAContext)
-        ):
+        )
+        if folded:
             if self.q_norm is None or self.k_norm is None or self._qk_norm_full:
                 raise ValueError(
                     "fused GQA rotary expects per-head Q/K norm; this attention "
                     f"has qk_norm={self.q_norm is not None}, full={self._qk_norm_full}"
                 )
+            # With nothing applied to K alone before the op, a projection that already
+            # produces [Q | K | V] in one tensor goes in as is: both ops take a packed
+            # query with key/value absent, which saves splitting it per layer.
+            packed = (
+                self._project_packed_qkv(op, hidden_states)
+                if math.isclose(self._key_multiplier, 1.0)
+                else None
+            )
+            if packed is not None:
+                query_states, key_states, value_states = packed, None, None
+            else:
+                query_states, key_states, value_states = self._project_qkv(op, hidden_states)
+                if not math.isclose(self._key_multiplier, 1.0):
+                    key_states = op.Mul(key_states, self._key_multiplier)
             if static_cache.block_table is not None:
                 return self._forward_paged(
                     op, query_states, key_states, value_states, attention_bias, static_cache
@@ -427,6 +438,10 @@ class Attention(nn.Module):
             return self._forward_gqa_static(
                 op, query_states, key_states, value_states, attention_bias, static_cache
             )
+
+        query_states, key_states, value_states = self._project_qkv(op, hidden_states)
+        if not math.isclose(self._key_multiplier, 1.0):
+            key_states = op.Mul(key_states, self._key_multiplier)
 
         if self.q_norm is not None and self.k_norm is not None:
             if self._qk_norm_full:
@@ -510,6 +525,10 @@ class Attention(nn.Module):
             self.k_proj(op, hidden_states),
             self.v_proj(op, hidden_states),
         )
+
+    def _project_packed_qkv(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value | None:
+        """Project into one packed ``[Q | K | V]`` tensor, or ``None`` if Q/K/V are separate projections."""
+        return None
 
     def _project_output(self, op: OpBuilder, attn_output: ir.Value) -> ir.Value:
         """Apply architecture-specific processing before the output projection."""
@@ -622,9 +641,15 @@ class Attention(nn.Module):
 
         q_width = self.num_attention_heads * self.head_dim
         kv_width = self.num_key_value_heads * self.head_dim
-        query_tokens = op.Reshape(query_states, op.Constant(value_ints=[-1, q_width]))
-        key_tokens = op.Reshape(key_states, op.Constant(value_ints=[-1, kv_width]))
-        value_tokens = op.Reshape(value_states, op.Constant(value_ints=[-1, kv_width]))
+        if key_states is None:  # packed [Q | K | V]; the op takes it as the query with key/value absent
+            query_tokens = op.Reshape(
+                query_states, op.Constant(value_ints=[-1, q_width + 2 * kv_width])
+            )
+            key_tokens = value_tokens = None
+        else:
+            query_tokens = op.Reshape(query_states, op.Constant(value_ints=[-1, q_width]))
+            key_tokens = op.Reshape(key_states, op.Constant(value_ints=[-1, kv_width]))
+            value_tokens = op.Reshape(value_states, op.Constant(value_ints=[-1, kv_width]))
         attn_out, present_key, present_value = op.PagedAttention(  # type: ignore[attr-defined]
             query_tokens,  # [num_tokens, num_heads * head_dim]
             key_tokens,
@@ -646,8 +671,11 @@ class Attention(nn.Module):
             _outputs=3,
             **attrs,
         )
-        # Back to [1, num_tokens, num_heads * head_dim] (v_head_size == head_dim).
-        attn_out = op.Reshape(attn_out, op.Shape(query_states))
+        # Back to [batch, num_tokens, num_heads * head_dim] (v_head_size == head_dim).
+        out_shape = op.Concat(
+            op.Shape(query_states, end=2), op.Constant(value_ints=[q_width]), axis=0
+        )
+        attn_out = op.Reshape(attn_out, out_shape)
         return self._project_output(op, attn_out), (present_key, present_value)
 
     def _forward_gqa(
@@ -738,15 +766,19 @@ class FusedQKVAttention(Attention):
             bias=config.attn_qkv_bias,
         )
 
-    def _project_qkv(
-        self, op: OpBuilder, hidden_states: ir.Value
-    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+    def _project_packed_qkv(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         # Keep clipping ahead of the split: this is observably different from
         # clipping only Q/K after RoPE or leaving V unclipped.
         qkv = self.qkv_proj(op, hidden_states)  # (B, S, Q + K + V)
         if self._clamp is not None and self._clamp > 0:
             limit = op.CastLike(self._clamp, qkv)
             qkv = op.Clip(qkv, op.Neg(limit), limit)
+        return qkv
+
+    def _project_qkv(
+        self, op: OpBuilder, hidden_states: ir.Value
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        qkv = self._project_packed_qkv(op, hidden_states)
         return op.Split(
             qkv,
             [self._q_width, self._kv_width, self._kv_width],

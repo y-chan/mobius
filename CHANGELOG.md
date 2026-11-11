@@ -73,6 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CPU EP. **The decoder loses its `position_ids` input** -- the op derives
   the rotary position from the KV length -- so a driving loop feeds one fewer
   tensor.
+- With `gqa-fused-rope` (and `paged-gqa`), a joined `[Q | K | V]`
+  projection (`FusedQKVAttention`) now goes into GroupQueryAttention /
+  PagedAttention packed, with key and value absent, instead of being split
+  into three tensors per layer: 48 fewer `Split` nodes. INT4 Qwen3-Omni
+  thinker on an RTX 3090: one decode step 3.95 -> 3.80 ms (decoder only),
+  237.1 -> 240.9 tokens/s end to end; logits unchanged (mean KL against the
+  float16-head reference 1e-5 either way).
 - `--features static-cache,gqa-cache,gqa-fused-rope,paged-gqa` builds the
   speech-language decoder on a block-paged KV cache owned by
   `com.microsoft::PagedAttention` instead of GQA's per-request static

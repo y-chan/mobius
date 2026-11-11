@@ -373,6 +373,11 @@ GEMVs go from 17.0 to 10.5 us: the two `N = 512` calls ran at 150-220 GB/s
 against 510-630 GB/s for the large ones, so a fixed per-call cost, not the
 bytes, was what they spent.
 
+With `gqa-fused-rope` the joined projection also goes into GroupQueryAttention
+packed (key and value absent) rather than split into three tensors: the
+`Split` kernel cost 2.2 us per layer, and decode goes 3.95 -> 3.80 ms per step,
+237.1 -> 240.9 tokens/s end to end, with the same logits.
+
 The decode embedding's host round trip -- the embedding session's `Run` plus
 the 4 KB copy into the captured graph's input -- costs 0.13 ms per step on
 this host, 2% of a step, against 0.06 ms on Blackwell. Binding the embedding

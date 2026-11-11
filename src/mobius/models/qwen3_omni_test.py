@@ -1128,6 +1128,14 @@ def test_gqa_fused_rope_matches_separate_ops(omni):
     }
     # Two norms and two rotaries per layer move inside the op.
     assert counts["fused"]["RotaryEmbedding"] == 0
+    # The joined [Q | K | V] projection goes into the op packed, so it is not split per layer.
+    assert counts["fused"]["Split"] == 0
+    assert all(
+        n.inputs[1] is None and n.inputs[2] is None
+        for n in fused.graph.all_nodes()
+        if n.op_type == "GroupQueryAttention"
+    )
+    assert counts["separate"]["Split"] == config.num_hidden_layers
     # The op is handed the positions rather than inferring them from the KV
     # length, so the input stays part of the decoder's contract.
     assert "position_ids" in {i.name for i in fused.graph.inputs}
@@ -1235,6 +1243,7 @@ def test_paged_gqa_matches_static_gqa(omni):
     counts = collections.Counter(n.op_type for n in paged.graph.all_nodes())
     assert counts["PagedAttention"] == config.num_hidden_layers
     assert counts["GroupQueryAttention"] == 0
+    assert counts["Split"] == 0  # the packed [Q | K | V] is the op's query
     assert counts["RotaryEmbedding"] == 0
     # The op takes each token's rotary position from past_seqlens, so position_ids drops out.
     assert {i.name for i in paged.graph.inputs if "cache" not in i.name} == {
